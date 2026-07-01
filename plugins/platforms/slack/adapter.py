@@ -3632,25 +3632,16 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             with ssdb.connect_closing() as conn:
                 ssdb.init_db(conn)
-                channels = ssdb.list_channel_summaries(conn)
-                if not channels:
+                all_threads = ssdb.list_summarized_threads(conn, limit=10)
+                if not all_threads:
                     return ""
 
                 parts = []
-                for ch in channels:
+                for t in all_threads:
                     parts.append(
-                        f"#{ch['channel_name']} ({ch['thread_count']} threads): "
-                        f"{ch['summary']}"
+                        f"- #{t['channel_name']} thread {t['thread_ts']} "
+                        f"({t['reply_count']} replies): {t['summary']}"
                     )
-                    threads = ssdb.list_thread_summaries(conn, ch["channel_id"])
-                    for t in threads:
-                        parts.append(
-                            f"  - Thread {t['thread_ts']} "
-                            f"({t['reply_count']} replies): {t['summary']}"
-                        )
-
-                if not parts:
-                    return ""
 
                 result = (
                     "[Channel activity summary — recent Slack threads collected by background cron:]\n"
