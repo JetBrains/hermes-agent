@@ -6795,7 +6795,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee is spawnable — a real Hermes profile (default lane) or a
+    registered external worker lane (plugin lane).
 
     Used by the gateway- and CLI-embedded dispatchers' health telemetry to
     decide whether ``0 spawned`` is a "stuck" condition (real spawnable
@@ -6803,51 +6804,89 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
     that pull tasks via ``claim_task`` directly).
 
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
-    importable (e.g. partial install) — preserves the old behavior so
-    the warning still fires in degraded environments.
+    Spawnability is delegated to :func:`_assignee_is_spawnable` — the same
+    predicate the dispatcher uses to bucket ``skipped_nonspawnable`` — so a
+    lane-only board (registered worker lanes, no Hermes profile assignees)
+    still trips the stuck-warn. That helper also preserves the legacy
+    "assume spawnable" fallback when ``profile_exists`` is not importable
+    (e.g. partial install), so the warning still fires in degraded envs.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    return any(_assignee_is_spawnable(row["assignee"]) for row in rows)
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee is spawnable — a real Hermes profile or a registered
+    external worker lane.
 
     Mirror of :func:`has_spawnable_ready` for the review column —
     used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
+    should have spawned a review agent. Shares the same
+    :func:`_assignee_is_spawnable` predicate so lane-only boards count.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
-    if not rows:
+    return any(_assignee_is_spawnable(row["assignee"]) for row in rows)
+
+
+def _get_worker_lane(assignee: Optional[str]):
+    """Return the registered WorkerLane for ``assignee``, or None.
+
+    Local import keeps the worker-lane registry an optional dependency: if the
+    module is unavailable the dispatcher simply behaves as before (Hermes
+    profile lanes only).
+    """
+    if not assignee:
+        return None
+    try:
+        from hermes_cli.worker_lanes import get_worker_lane
+    except Exception:
+        return None
+    return get_worker_lane(assignee)
+
+
+def _assignee_is_spawnable(assignee: Optional[str]) -> bool:
+    """True if ``assignee`` names a Hermes profile (default lane) or a
+    registered external worker lane (plugin lane).
+
+    Unresolvable assignees (e.g. interactive terminal lanes pulled via
+    ``claim_task``) are NOT spawnable: auto-spawning ``hermes -p <assignee>``
+    for them would crash on startup and loop the task back to ``ready`` forever
+    (#kanban-dispatcher-crash-loop 2026-05-05).
+    """
+    if not assignee:
         return False
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
+        # profiles module unavailable — preserve legacy behavior (don't block).
         return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    if profile_exists(assignee):
+        return True
+    return _get_worker_lane(assignee) is not None
+
+
+def _resolve_spawn_fn(assignee: Optional[str], spawn_fn):
+    """Pick the spawn callable: explicit override > registered lane > default.
+
+    An explicit ``spawn_fn`` (passed by tests / callers) always wins. Otherwise
+    a registered worker lane's ``spawn_fn`` is used when the assignee resolves
+    to one; profile assignees fall back to ``_default_spawn`` (``hermes -p``).
+    """
+    if spawn_fn is not None:
+        return spawn_fn
+    lane = _get_worker_lane(assignee)
+    if lane is not None:
+        return lane.spawn_fn
+    return _default_spawn
 
 
 def dispatch_once(
@@ -7035,13 +7074,12 @@ def _dispatch_once_locked(
         and max_in_progress_per_profile > 0
     ) else None
     _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+    for prow in conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status = 'running' AND assignee IS NOT NULL "
+        "GROUP BY assignee"
+    ):
+        _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -7105,27 +7143,11 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
-        # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
-        # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane (e.g. an interactive Claude Code terminal
-        # like ``orion-cc`` / ``orion-research``) rather than a Hermes
-        # profile. Those task lanes are pulled by terminals via
-        # ``claim_task`` directly and should NEVER auto-spawn — the
-        # subprocess would crash on startup, get reaped as a zombie,
-        # the task would loop back to ``ready`` on next tick, and we'd
-        # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
+        # Non-spawnable assignees (e.g. control-plane terminal lanes pulled via
+        # claim_task) go to skipped_nonspawnable, kept apart from
+        # skipped_unassigned so health telemetry can tell operator-unfixable
+        # lanes from genuinely unassigned work. See _assignee_is_spawnable.
+        if not _assignee_is_spawnable(row_assignee):
             result.skipped_nonspawnable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
@@ -7134,9 +7156,17 @@ def _dispatch_once_locked(
         # quota / browser pool from being overwhelmed by a fan-out
         # while the global max_in_progress / max_spawn caps still allow
         # work on OTHER profiles.
-        if _per_profile_cap is not None:
+        # A worker lane may declare its own max_concurrency (e.g. one external-CLI run
+        # at a time); otherwise the global per-profile cap applies.
+        _lane = _get_worker_lane(row_assignee)
+        _eff_cap = (
+            _lane.max_concurrency
+            if _lane is not None and _lane.max_concurrency is not None
+            else _per_profile_cap
+        )
+        if _eff_cap is not None:
             current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
+            if current >= _eff_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
@@ -7164,11 +7194,11 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
-            # Increment per-profile counter even in dry_run so the cap
+            # Increment per-assignee counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
             # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
+            if _eff_cap is not None and row_assignee:
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
@@ -7195,7 +7225,9 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        # Route to the assignee's worker lane when no explicit spawn_fn override
+        # is supplied; profile assignees fall back to _default_spawn (hermes -p).
+        _spawn = _resolve_spawn_fn(row_assignee, spawn_fn)
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -7220,10 +7252,11 @@ def _dispatch_once_locked(
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
-            # Track the new in-flight count for this profile so later
-            # iterations in this same tick respect the per-profile cap
-            # (#21582). Subsequent ticks re-query from the DB.
-            if _per_profile_cap is not None and claimed.assignee:
+            # Track the new in-flight count for this assignee so later
+            # iterations in this same tick respect the effective cap — the
+            # global per-profile cap OR a per-lane max_concurrency (#21582).
+            # Subsequent ticks re-query from the DB.
+            if _eff_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
@@ -7255,11 +7288,7 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if not _assignee_is_spawnable(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
@@ -7293,7 +7322,7 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _spawn = _resolve_spawn_fn(row["assignee"], spawn_fn)
         try:
             import inspect
             try:
@@ -7607,11 +7636,21 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
-    env = dict(os.environ)
+    # Build the shared HERMES_KANBAN_* worker contract once.
+    # ``kanban_worker_env`` (in worker_lanes) is the single source of truth
+    # for the env a spawned worker needs to converge on the dispatcher's
+    # board / DB / workspaces root / run / claim / tenant — and it pins
+    # TERMINAL_CWD to the workspace. Hermes profile workers (this function)
+    # and external lane ``spawn_fn`` implementations share the exact same
+    # contract through this helper, so the two copies can never drift.
+    # Local import keeps worker_lanes an optional dependency and avoids an
+    # import cycle (worker_lanes imports kanban_db lazily in turn).
+    from hermes_cli.worker_lanes import kanban_worker_env
+    env = kanban_worker_env(task, workspace, board=board)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
-    # config.  Without this, `env = dict(os.environ)` copies only the parent's
+    # config.  Without this, the inherited env copies only the parent's
     # env, and when the child process starts `hermes -p <name>` the
     # _apply_profile_override() runs *before* hermes_constants is imported.
     # If HERMES_HOME is absent from the child's env, get_hermes_home() falls
@@ -7627,30 +7666,8 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
-    if task.tenant:
-        env["HERMES_TENANT"] = task.tenant
-    env["HERMES_KANBAN_TASK"] = task.id
-    env["HERMES_KANBAN_WORKSPACE"] = workspace
-    # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
-    # context-file loader anchor on the workspace, not whatever cwd the
-    # dispatching gateway happened to export. The worker subprocess is already
-    # launched with cwd=workspace, but TERMINAL_CWD takes precedence over the
-    # process cwd in both file_tools._resolve_base_dir (#41312 — relative
-    # write_file paths were landing in the gateway user's home) and
-    # build_context_files_prompt (#34619 — workers loaded the dispatching
-    # gateway's AGENTS.md instead of the task's). Setting it to the workspace
-    # fixes both: the workspace is where the task's work actually happens.
-    # Only pin a real, absolute directory — file_tools rejects relative /
-    # sentinel TERMINAL_CWD values, so a non-dir workspace must NOT be set
-    # here (leave the inherited value rather than write a meaningless one).
-    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
-        env["TERMINAL_CWD"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
-    if task.current_run_id is not None:
-        env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
-    if task.claim_lock:
-        env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
@@ -7670,19 +7687,6 @@ def _default_spawn(
     )
     if foreground_timeout is not None:
         env["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = foreground_timeout
-    # Pin the shared board + workspaces root the dispatcher resolved, so
-    # that even when the worker activates a profile (`hermes -p <name>`
-    # rewrites HERMES_HOME), its kanban paths still match the
-    # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
-    # resolution in `kanban_home()` — symmetric resolution is the norm,
-    # but unusual symlink / Docker layouts are caught here too.
-    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
-    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
-    # Board slug — the final defense-in-depth pin. If the worker ever
-    # resolves kanban paths without the DB / workspaces env vars, the
-    # board slug still forces it to the right directory.
-    resolved_board = _normalize_board_slug(board) or get_current_board()
-    env["HERMES_KANBAN_BOARD"] = resolved_board
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
