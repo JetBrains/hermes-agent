@@ -297,6 +297,7 @@ ALIASES: Dict[str, str] = {
     "github-copilot-acp": "copilot-acp",
     "jetbrains-junie-acp": "junie-acp",
     "junie-acp-agent": "junie-acp",
+    "junie": "junie-acp",
 
     # opencode (models.dev ID for OpenCode Zen)
     "opencode-zen": "opencode",

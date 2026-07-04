@@ -273,6 +273,21 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "copilot-acp": [
         "copilot-acp",
     ],
+    # Junie picks its own model via the ACP session's configOptions; the model
+    # Hermes sends is only a hint. These are the model IDs Junie exposes today
+    # (see `junie --acp=true` session/new configOptions). "junie-acp" is the
+    # provider-default sentinel that lets Junie use its own configured default.
+    "junie-acp": [
+        "junie-acp",
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite",
+        "claude-sonnet-5",
+        "claude-opus-4-8",
+        "claude-fable-5",
+        "gpt-5.4",
+        "gpt-5.5",
+        "grok-4.3",
+    ],
     "copilot": [
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -1066,6 +1081,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
+    ProviderEntry("junie-acp",      "JetBrains Junie ACP",      "JetBrains Junie ACP (Spawns junie --acp=true)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
     ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
@@ -1144,6 +1160,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "openai":   ("OpenAI",          "Codex CLI or direct OpenAI API",                  ["openai-codex", "openai-api"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go or Go subscription",            ["opencode-zen", "opencode-go"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
+    "junie":    ("JetBrains Junie",  "Junie CLI coding agent via ACP subprocess",       ["junie-acp"]),
 }
 
 # Reverse index: member slug -> group_id. Built once at import.
@@ -1228,6 +1245,9 @@ _PROVIDER_ALIASES = {
     "github-model": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "jetbrains-junie-acp": "junie-acp",
+    "junie-acp-agent": "junie-acp",
+    "junie": "junie-acp",
     "google": "gemini",
     "google-gemini": "gemini",
     "google-ai-studio": "gemini",
@@ -2328,6 +2348,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             pass
         if normalized == "copilot-acp":
             return list(_PROVIDER_MODELS.get("copilot", []))
+    if normalized == "junie-acp":
+        return list(_PROVIDER_MODELS.get("junie-acp", []))
     if normalized == "nous":
         # Try live Nous Portal /models endpoint
         try:
