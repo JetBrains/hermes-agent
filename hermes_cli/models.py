@@ -1245,6 +1245,7 @@ _PROVIDER_ALIASES = {
     "github-model": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    # JetBrains Junie (ACP coding agent)
     "jetbrains-junie-acp": "junie-acp",
     "junie-acp-agent": "junie-acp",
     "junie": "junie-acp",
