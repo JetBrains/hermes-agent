@@ -18,8 +18,30 @@ from agent.junie_acp_client import (
     _merge_tool_update,
     _render_tool_activity,
     _resolve_args,
+    _resolve_brave_override,
     _resolve_command,
+    _resolve_permission_policy,
 )
+
+# Real session/request_permission request captured from a live `junie --acp=true`
+# run (probe): brave OFF -> Junie asks before acting, offering allow_once.
+_GOLDEN_PERMISSION_REQUEST = {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "method": "session/request_permission",
+    "params": {
+        "sessionId": "session-260705-102127-qxtm",
+        "toolCall": {
+            "toolCallId": "statistics-consent",
+            "title": "Share anonymous usage statistics with JetBrains",
+            "kind": "other",
+            "status": "pending",
+        },
+        "options": [
+            {"optionId": "yes", "name": "Yes, share anonymous statistics", "kind": "allow_once"}
+        ],
+    },
+}
 
 # Real tool_call notification captured from a live `junie --acp=true` run
 # (probe): Junie ran a directory listing and reported it as COMPLETED activity.
@@ -216,6 +238,75 @@ class JunieNativeToolActivityTests(unittest.TestCase):
         self.assertEqual(choice.message.tool_calls, [])          # NOT executed
         self.assertEqual(choice.finish_reason, "stop")
         self.assertIn("<tool_call>", choice.message.content)     # passed through verbatim
+
+
+class JuniePermissionPolicyTests(unittest.TestCase):
+    """Feature (c): configurable answer to session/request_permission."""
+
+    def _dispatch(self, client):
+        process = _FakeProcess()
+        handled = client._handle_server_message(
+            _GOLDEN_PERMISSION_REQUEST, process=process, cwd="/tmp",
+            text_parts=[], reasoning_parts=[], tool_events={},
+        )
+        self.assertTrue(handled)
+        return json.loads(process.stdin.getvalue().strip())
+
+    def test_deny_policy_cancels(self):
+        client = JunieACPClient(acp_cwd="/tmp", permission_policy="deny")
+        resp = self._dispatch(client)
+        self.assertEqual(resp["result"]["outcome"]["outcome"], "cancelled")
+
+    def test_allow_policy_selects_allow_option(self):
+        client = JunieACPClient(acp_cwd="/tmp", permission_policy="allow")
+        resp = self._dispatch(client)
+        outcome = resp["result"]["outcome"]
+        self.assertEqual(outcome["outcome"], "selected")
+        self.assertEqual(outcome["optionId"], "yes")   # the allow_once option
+
+    def test_allow_policy_without_allow_option_cancels(self):
+        client = JunieACPClient(acp_cwd="/tmp", permission_policy="allow")
+        req = json.loads(json.dumps(_GOLDEN_PERMISSION_REQUEST))
+        req["params"]["options"] = [{"optionId": "no", "name": "Deny", "kind": "reject_once"}]
+        process = _FakeProcess()
+        client._handle_server_message(req, process=process, cwd="/tmp",
+                                      text_parts=[], reasoning_parts=[], tool_events={})
+        resp = json.loads(process.stdin.getvalue().strip())
+        self.assertEqual(resp["result"]["outcome"]["outcome"], "cancelled")
+
+    def test_default_policy_is_deny(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_resolve_permission_policy(), "deny")
+
+    def test_permission_policy_env(self):
+        with patch.dict(os.environ, {"HERMES_JUNIE_ACP_PERMISSION": "allow"}, clear=True):
+            self.assertEqual(_resolve_permission_policy(), "allow")
+        with patch.dict(os.environ, {"HERMES_JUNIE_ACP_PERMISSION": "deny"}, clear=True):
+            self.assertEqual(_resolve_permission_policy(), "deny")
+
+
+class JunieBraveModeTests(unittest.TestCase):
+    """Feature (c): configurable Brave Mode."""
+
+    def test_brave_override_env_parsing(self):
+        for on in ("on", "1", "true", "yes"):
+            with patch.dict(os.environ, {"HERMES_JUNIE_ACP_BRAVE": on}, clear=True):
+                self.assertIs(_resolve_brave_override(), True)
+        for off in ("off", "0", "false", "no"):
+            with patch.dict(os.environ, {"HERMES_JUNIE_ACP_BRAVE": off}, clear=True):
+                self.assertIs(_resolve_brave_override(), False)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(_resolve_brave_override())
+
+    def test_constructor_override_beats_env(self):
+        with patch.dict(os.environ, {"HERMES_JUNIE_ACP_BRAVE": "off"}, clear=True):
+            client = JunieACPClient(acp_cwd="/tmp", brave_mode=True)
+        self.assertIs(client._brave_override, True)
+
+    def test_brave_default_is_no_override(self):
+        with patch.dict(os.environ, {}, clear=True):
+            client = JunieACPClient(acp_cwd="/tmp")
+        self.assertIsNone(client._brave_override)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,31 @@ def _resolve_args() -> list[str]:
     return args
 
 
+def _resolve_permission_policy() -> str:
+    """How the client answers Junie's session/request_permission requests.
+
+    "deny" (default, safe): reject every request (Junie can't act without
+    explicit consent — matters only when Brave Mode is OFF). "allow": approve
+    once. This is the seam a future Hermes-approval bridge would replace.
+    """
+    val = os.getenv("HERMES_JUNIE_ACP_PERMISSION", "").strip().lower()
+    return "allow" if val in ("allow", "allow_once", "yes", "1", "true") else "deny"
+
+
+def _resolve_brave_override() -> bool | None:
+    """Optional override for Junie's Brave Mode (auto-execute without asking).
+
+    Returns True/False to force it via session/set_config_option, or None to
+    leave Junie on its own persisted/default setting.
+    """
+    val = os.getenv("HERMES_JUNIE_ACP_BRAVE", "").strip().lower()
+    if val in ("on", "1", "true", "yes"):
+        return True
+    if val in ("off", "0", "false", "no"):
+        return False
+    return None
+
+
 def _resolve_home_dir() -> str:
     """Return a stable HOME for child ACP processes."""
     home = os.environ.get("HOME", "").strip()
@@ -113,16 +138,29 @@ def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     }
 
 
-def _permission_denied(message_id: Any) -> dict[str, Any]:
-    return {
-        "jsonrpc": "2.0",
-        "id": message_id,
-        "result": {
-            "outcome": {
-                "outcome": "cancelled",
-            }
-        },
-    }
+_ALLOW_OPTION_KINDS = ("allow_once", "allow_always")
+
+
+def _permission_response(message_id: Any, params: dict[str, Any], *, policy: str) -> dict[str, Any]:
+    """Answer a session/request_permission request per ``policy``.
+
+    ACP outcomes: ``{"outcome": {"outcome": "selected", "optionId": ...}}`` to
+    approve (we pick an allow-kind option the request offered), or
+    ``{"outcome": {"outcome": "cancelled"}}`` to reject. A request with no
+    allow option (or ``policy="deny"``) is always cancelled.
+    """
+    tool_call = params.get("toolCall") or {}
+    title = tool_call.get("title") or tool_call.get("toolCallId") or "?"
+    if policy == "allow":
+        for opt in params.get("options") or []:
+            if isinstance(opt, dict) and str(opt.get("kind", "")).lower() in _ALLOW_OPTION_KINDS:
+                option_id = opt.get("optionId") or opt.get("id")
+                if option_id:
+                    logger.info("Junie ACP permission ALLOW: %s (option=%s)", title, option_id)
+                    return {"jsonrpc": "2.0", "id": message_id,
+                            "result": {"outcome": {"outcome": "selected", "optionId": option_id}}}
+    logger.info("Junie ACP permission DENY: %s (policy=%s)", title, policy)
+    return {"jsonrpc": "2.0", "id": message_id, "result": {"outcome": {"outcome": "cancelled"}}}
 
 
 def _format_messages_as_prompt(
@@ -298,6 +336,8 @@ class JunieACPClient:
         acp_cwd: str | None = None,
         command: str | None = None,
         args: list[str] | None = None,
+        permission_policy: str | None = None,
+        brave_mode: bool | None = None,
         **_: Any,
     ):
         self.api_key = api_key or "junie-acp"
@@ -306,6 +346,9 @@ class JunieACPClient:
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        self._permission_policy = permission_policy or _resolve_permission_policy()
+        # None => don't override Junie's own Brave Mode setting.
+        self._brave_override = brave_mode if brave_mode is not None else _resolve_brave_override()
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -531,6 +574,20 @@ class JunieACPClient:
             if not session_id:
                 raise RuntimeError("Junie ACP did not return a sessionId.")
 
+            # Optionally force Junie's Brave Mode. configId (not id) is the
+            # required key; verified against the live CLI. Best-effort: a failure
+            # to set it must not abort the prompt.
+            if self._brave_override is not None:
+                try:
+                    _request(
+                        "session/set_config_option",
+                        {"sessionId": session_id, "configId": "brave_mode",
+                         "value": self._brave_override},
+                    )
+                    logger.info("Junie ACP brave_mode set to %s", self._brave_override)
+                except Exception as exc:
+                    logger.warning("Junie ACP set brave_mode failed: %s", exc)
+
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             tool_events: dict[str, dict[str, Any]] = {}
@@ -595,7 +652,7 @@ class JunieACPClient:
         params = msg.get("params") or {}
 
         if method == "session/request_permission":
-            response = _permission_denied(message_id)
+            response = _permission_response(message_id, params, policy=self._permission_policy)
         elif method == "fs/read_text_file":
             try:
                 path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)
