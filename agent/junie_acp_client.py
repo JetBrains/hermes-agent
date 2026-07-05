@@ -20,9 +20,9 @@ Junie specifics (vs Copilot):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
-import re
 import shlex
 import subprocess
 import threading
@@ -35,11 +35,17 @@ from typing import Any
 from agent.file_safety import get_read_block_error, is_write_denied
 from agent.redact import redact_sensitive_text
 
+logger = logging.getLogger(__name__)
+
 ACP_MARKER_BASE_URL = "acp://junie"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
-_TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
+# Junie's ACP session/update kinds that report tool activity. Unlike an OpenAI
+# model, Junie is an autonomous agent that EXECUTES its own tools and reports
+# them here (status pending -> in_progress -> completed/failed) — these are NOT
+# delegation requests for Hermes to run. We consume them for observability, not
+# to fabricate OpenAI tool_calls (see JunieACPClient._create_chat_completion).
+_TOOL_UPDATE_KINDS = ("tool_call", "tool_call_update")
 
 
 def _resolve_command() -> str:
@@ -125,43 +131,18 @@ def _format_messages_as_prompt(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
 ) -> str:
+    # Junie is an autonomous coding agent: it runs its OWN tools (read/edit/
+    # execute) inside the ACP session and reports them via native tool_call
+    # notifications. We therefore do NOT ask it to emit OpenAI-style tool
+    # calls; it should just do the work and answer. Hermes' own tool schemas
+    # are irrelevant to Junie's execution, so we don't inject them.
+    del tools, tool_choice  # accepted for OpenAI-client compatibility; unused
     sections: list[str] = [
-        "You are being used as the active ACP agent backend for Hermes.",
-        "Use ACP capabilities to complete tasks.",
-        "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
-        "If no tool is needed, answer normally.",
+        "You are being used as the active ACP coding agent backend for Hermes.",
+        "Use your own tools to complete the task, then answer normally.",
     ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")
-
-    if isinstance(tools, list) and tools:
-        tool_specs: list[dict[str, Any]] = []
-        for t in tools:
-            if not isinstance(t, dict):
-                continue
-            fn = t.get("function") or {}
-            if not isinstance(fn, dict):
-                continue
-            name = fn.get("name")
-            if not isinstance(name, str) or not name.strip():
-                continue
-            tool_specs.append(
-                {
-                    "name": name.strip(),
-                    "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters", {}),
-                }
-            )
-        if tool_specs:
-            sections.append(
-                "Available tools (OpenAI function schema). "
-                "When using a tool, emit ONLY <tool_call>{...}</tool_call> with one JSON object "
-                "containing id/type/function{name,arguments}. arguments must be a JSON string.\n"
-                + json.dumps(tool_specs, ensure_ascii=False)
-            )
-
-    if tool_choice is not None:
-        sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
 
     transcript: list[str] = []
     for message in messages:
@@ -218,77 +199,63 @@ def _render_message_content(content: Any) -> str:
     return str(content).strip()
 
 
-def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str]:
-    if not isinstance(text, str) or not text.strip():
-        return [], ""
-
-    extracted: list[SimpleNamespace] = []
-    consumed_spans: list[tuple[int, int]] = []
-
-    def _try_add_tool_call(raw_json: str) -> None:
-        try:
-            obj = json.loads(raw_json)
-        except Exception:
-            return
-        if not isinstance(obj, dict):
-            return
-        fn = obj.get("function")
-        if not isinstance(fn, dict):
-            return
-        fn_name = fn.get("name")
-        if not isinstance(fn_name, str) or not fn_name.strip():
-            return
-        fn_args = fn.get("arguments", "{}")
-        if not isinstance(fn_args, str):
-            fn_args = json.dumps(fn_args, ensure_ascii=False)
-        call_id = obj.get("id")
-        if not isinstance(call_id, str) or not call_id.strip():
-            call_id = f"acp_call_{len(extracted)+1}"
-
-        extracted.append(
-            SimpleNamespace(
-                id=call_id,
-                call_id=call_id,
-                response_item_id=None,
-                type="function",
-                function=SimpleNamespace(name=fn_name.strip(), arguments=fn_args),
-            )
-        )
-
-    for m in _TOOL_CALL_BLOCK_RE.finditer(text):
-        raw = m.group(1)
-        _try_add_tool_call(raw)
-        consumed_spans.append((m.start(), m.end()))
-
-    # Only try bare-JSON fallback when no XML blocks were found.
-    if not extracted:
-        for m in _TOOL_CALL_JSON_RE.finditer(text):
-            raw = m.group(0)
-            _try_add_tool_call(raw)
-            consumed_spans.append((m.start(), m.end()))
-
-    if not consumed_spans:
-        return extracted, text.strip()
-
-    consumed_spans.sort()
-    merged: list[tuple[int, int]] = []
-    for start, end in consumed_spans:
-        if not merged or start > merged[-1][1]:
-            merged.append((start, end))
-        else:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-
+def _tool_update_text(update: dict[str, Any]) -> str:
+    """Best-effort plain-text extraction from an ACP tool_call content list."""
     parts: list[str] = []
-    cursor = 0
-    for start, end in merged:
-        if cursor < start:
-            parts.append(text[cursor:start])
-        cursor = max(cursor, end)
-    if cursor < len(text):
-        parts.append(text[cursor:])
+    for block in update.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        inner = block.get("content")
+        if isinstance(inner, dict) and isinstance(inner.get("text"), str):
+            parts.append(inner["text"])
+        elif isinstance(block.get("text"), str):
+            parts.append(block["text"])
+    return "\n".join(p for p in parts if p and p.strip()).strip()
 
-    cleaned = "\n".join(p.strip() for p in parts if p and p.strip()).strip()
-    return extracted, cleaned
+
+def _merge_tool_update(store: dict[str, dict[str, Any]], update: dict[str, Any]) -> None:
+    """Fold a tool_call / tool_call_update notification into ``store`` by id.
+
+    Junie streams a ``tool_call`` (first-seen) then zero or more
+    ``tool_call_update`` messages sharing the same ``toolCallId`` as the tool
+    progresses (pending -> in_progress -> completed/failed). We keep the latest
+    non-empty value for each field so ``store`` ends up with the final state.
+    """
+    tcid = str(update.get("toolCallId") or f"tool_{len(store)}")
+    entry = store.setdefault(tcid, {"id": tcid})
+    for field in ("title", "kind", "status"):
+        val = update.get(field)
+        if val:
+            entry[field] = val
+    text = _tool_update_text(update)
+    if text:
+        entry["result"] = text
+    locations = update.get("locations")
+    if locations:
+        entry["locations"] = locations
+
+
+def _render_tool_activity(tool_events: dict[str, dict[str, Any]]) -> str:
+    """Render captured tool activity as a compact, human-readable summary.
+
+    Surfaced via the assistant message's ``reasoning`` so the operator can see
+    what Junie actually did, without misrepresenting completed actions as
+    OpenAI tool_calls Hermes must execute.
+    """
+    lines: list[str] = []
+    for ev in tool_events.values():
+        kind = ev.get("kind", "tool")
+        status = ev.get("status", "")
+        title = ev.get("title", "")
+        head = f"[{kind}] {title}".strip()
+        if status:
+            head = f"{head} ({status})"
+        lines.append(head)
+        result = ev.get("result")
+        if result:
+            snippet = result if len(result) <= 500 else result[:500] + "…"
+            lines.append(f"    → {snippet}")
+    return "\n".join(lines).strip()
 
 
 def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
@@ -393,12 +360,28 @@ class JunieACPClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        response_text, reasoning_text = self._run_prompt(
+        response_text, reasoning_text, tool_events = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
         )
 
-        tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        # Junie executes its own tools and reports them as completed activity;
+        # they are NOT delegation requests, so we never surface them as OpenAI
+        # tool_calls (that would make Hermes try to re-run finished work).
+        # Instead we log them and fold a readable summary into `reasoning`.
+        activity = _render_tool_activity(tool_events)
+        if tool_events:
+            for ev in tool_events.values():
+                logger.info(
+                    "Junie ACP tool activity: kind=%s status=%s title=%s",
+                    ev.get("kind"), ev.get("status"), ev.get("title"),
+                )
+        combined_reasoning = "\n\n".join(
+            p for p in (
+                (f"Junie tool activity:\n{activity}" if activity else ""),
+                reasoning_text or "",
+            ) if p
+        ).strip() or None
 
         usage = SimpleNamespace(
             prompt_tokens=0,
@@ -407,21 +390,22 @@ class JunieACPClient:
             prompt_tokens_details=SimpleNamespace(cached_tokens=0),
         )
         assistant_message = SimpleNamespace(
-            content=cleaned_text,
-            tool_calls=tool_calls,
-            reasoning=reasoning_text or None,
-            reasoning_content=reasoning_text or None,
+            content=response_text.strip(),
+            tool_calls=[],
+            reasoning=combined_reasoning,
+            reasoning_content=combined_reasoning,
             reasoning_details=None,
         )
-        finish_reason = "tool_calls" if tool_calls else "stop"
-        choice = SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
+        choice = SimpleNamespace(message=assistant_message, finish_reason="stop")
         return SimpleNamespace(
             choices=[choice],
             usage=usage,
             model=model or "junie-acp",
         )
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self, prompt_text: str, *, timeout_seconds: float
+    ) -> tuple[str, str, dict[str, dict[str, Any]]]:
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -472,7 +456,7 @@ class JunieACPClient:
 
         next_id = 0
 
-        def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None, reasoning_parts: list[str] | None = None) -> Any:
+        def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None, reasoning_parts: list[str] | None = None, tool_events: dict[str, dict[str, Any]] | None = None) -> Any:
             nonlocal next_id
             next_id += 1
             request_id = next_id
@@ -500,6 +484,7 @@ class JunieACPClient:
                     cwd=self._acp_cwd,
                     text_parts=text_parts,
                     reasoning_parts=reasoning_parts,
+                    tool_events=tool_events,
                 ):
                     continue
 
@@ -548,6 +533,7 @@ class JunieACPClient:
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
+            tool_events: dict[str, dict[str, Any]] = {}
             _request(
                 "session/prompt",
                 {
@@ -561,8 +547,9 @@ class JunieACPClient:
                 },
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
+                tool_events=tool_events,
             )
-            return "".join(text_parts), "".join(reasoning_parts)
+            return "".join(text_parts), "".join(reasoning_parts), tool_events
         finally:
             self.close()
 
@@ -574,6 +561,7 @@ class JunieACPClient:
         cwd: str,
         text_parts: list[str] | None,
         reasoning_parts: list[str] | None,
+        tool_events: dict[str, dict[str, Any]] | None = None,
     ) -> bool:
         method = msg.get("method")
         if not isinstance(method, str):
@@ -583,6 +571,13 @@ class JunieACPClient:
             params = msg.get("params") or {}
             update = params.get("update") or {}
             kind = str(update.get("sessionUpdate") or "").strip()
+            if kind in _TOOL_UPDATE_KINDS:
+                # Native structured tool activity (content is a list of blocks).
+                # Captured for observability, NOT turned into OpenAI tool_calls.
+                if tool_events is not None:
+                    _merge_tool_update(tool_events, update)
+                return True
+            # agent_message_chunk / agent_thought_chunk carry a dict content.
             content = update.get("content") or {}
             chunk_text = ""
             if isinstance(content, dict):

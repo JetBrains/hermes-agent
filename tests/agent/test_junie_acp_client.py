@@ -13,7 +13,33 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.junie_acp_client import JunieACPClient, _resolve_args, _resolve_command
+from agent.junie_acp_client import (
+    JunieACPClient,
+    _merge_tool_update,
+    _render_tool_activity,
+    _resolve_args,
+    _resolve_command,
+)
+
+# Real tool_call notification captured from a live `junie --acp=true` run
+# (probe): Junie ran a directory listing and reported it as COMPLETED activity.
+_GOLDEN_TOOL_CALL = {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "0ac1e415-01cd-4136-b822-d85bb77de24c",
+    "title": 'Found "*"',
+    "kind": "other",
+    "status": "pending",
+    "content": [],
+    "locations": [],
+}
+_GOLDEN_TOOL_CALL_UPDATE = {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "0ac1e415-01cd-4136-b822-d85bb77de24c",
+    "status": "completed",
+    "content": [
+        {"type": "content", "content": {"type": "text", "text": "alpha.txt\nbeta.txt\ngamma.log\n"}}
+    ],
+}
 
 
 class _FakeProcess:
@@ -114,6 +140,82 @@ class JunieLaunchResolutionTests(unittest.TestCase):
         self.assertEqual(args.count("--auth"), 1)
         self.assertIn("explicit", args)
         self.assertNotIn("perm-token", args)
+
+
+class JunieNativeToolActivityTests(unittest.TestCase):
+    """Feature (b): consume native tool_call/tool_call_update notifications."""
+
+    def _feed(self, client, update):
+        client._handle_server_message(
+            {"jsonrpc": "2.0", "method": "session/update", "params": {"update": update}},
+            process=_FakeProcess(),
+            cwd="/tmp",
+            text_parts=[],
+            reasoning_parts=[],
+            tool_events=self.tool_events,
+        )
+
+    def setUp(self):
+        self.client = JunieACPClient(acp_cwd="/tmp")
+        self.tool_events = {}
+
+    def test_tool_call_then_update_merge_by_id(self):
+        """A tool_call + tool_call_update with the same id fold into one entry."""
+        self._feed(self.client, _GOLDEN_TOOL_CALL)
+        self._feed(self.client, _GOLDEN_TOOL_CALL_UPDATE)
+
+        self.assertEqual(len(self.tool_events), 1)
+        ev = self.tool_events["0ac1e415-01cd-4136-b822-d85bb77de24c"]
+        self.assertEqual(ev["status"], "completed")   # latest non-empty wins
+        self.assertEqual(ev["kind"], "other")         # preserved from first msg
+        self.assertEqual(ev["title"], 'Found "*"')
+        self.assertIn("gamma.log", ev["result"])       # extracted nested content
+
+    def test_render_tool_activity_is_readable(self):
+        self._feed(self.client, _GOLDEN_TOOL_CALL)
+        self._feed(self.client, _GOLDEN_TOOL_CALL_UPDATE)
+        rendered = _render_tool_activity(self.tool_events)
+        self.assertIn("[other]", rendered)
+        self.assertIn("completed", rendered)
+        self.assertIn("gamma.log", rendered)
+
+    def test_tool_updates_do_not_touch_text_or_reasoning(self):
+        text_parts, reasoning_parts = [], []
+        self.client._handle_server_message(
+            {"jsonrpc": "2.0", "method": "session/update", "params": {"update": _GOLDEN_TOOL_CALL_UPDATE}},
+            process=_FakeProcess(), cwd="/tmp",
+            text_parts=text_parts, reasoning_parts=reasoning_parts, tool_events={},
+        )
+        self.assertEqual(text_parts, [])
+        self.assertEqual(reasoning_parts, [])
+
+    def test_completion_never_fabricates_openai_tool_calls(self):
+        """Junie is autonomous: completed activity must NOT become tool_calls."""
+        events = {}
+        _merge_tool_update(events, _GOLDEN_TOOL_CALL)
+        _merge_tool_update(events, _GOLDEN_TOOL_CALL_UPDATE)
+        with patch.object(
+            self.client, "_run_prompt",
+            return_value=("Here are the files.", "", events),
+        ):
+            resp = self.client._create_chat_completion(model="junie-acp", messages=[])
+        choice = resp.choices[0]
+        self.assertEqual(choice.finish_reason, "stop")
+        self.assertEqual(choice.message.tool_calls, [])
+        self.assertEqual(choice.message.content, "Here are the files.")
+        # tool activity surfaced via reasoning, not fabricated as a tool call
+        self.assertIn("Junie tool activity", choice.message.reasoning)
+        self.assertIn("gamma.log", choice.message.reasoning)
+
+    def test_literal_tool_call_text_is_not_parsed(self):
+        """Regression: the old <tool_call> regex is gone — such text is inert."""
+        poison = 'Sure — <tool_call>{"id":"x","type":"function","function":{"name":"rm","arguments":"{}"}}</tool_call> done.'
+        with patch.object(self.client, "_run_prompt", return_value=(poison, "", {})):
+            resp = self.client._create_chat_completion(model="junie-acp", messages=[])
+        choice = resp.choices[0]
+        self.assertEqual(choice.message.tool_calls, [])          # NOT executed
+        self.assertEqual(choice.finish_reason, "stop")
+        self.assertIn("<tool_call>", choice.message.content)     # passed through verbatim
 
 
 if __name__ == "__main__":
