@@ -351,15 +351,32 @@ class JunieACPClient:
         self._brave_override = brave_mode if brave_mode is not None else _resolve_brave_override()
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
-        self._active_process: subprocess.Popen[str] | None = None
+        # Persistent subprocess reused across requests (avoids Junie/JVM cold
+        # start on every Hermes step). One process handles many independent
+        # sessions; we open a fresh session per request and re-send the full
+        # transcript, so we never rely on Junie's cross-turn memory matching
+        # Hermes' history (no divergence risk). Verified: one process serves
+        # multiple session/new, and draining until quiescence after a prompt
+        # response is required before the next turn (the ACP completion signal
+        # can precede trailing text / task finalization).
+        self._proc: subprocess.Popen[str] | None = None
+        self._inbox: queue.Queue[dict[str, Any]] | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=40)
+        self._next_id = 0
+        self._initialized = False
+        self._req_lock = threading.Lock()
         self._active_process_lock = threading.Lock()
 
     def close(self) -> None:
-        proc: subprocess.Popen[str] | None
-        with self._active_process_lock:
-            proc = self._active_process
-            self._active_process = None
         self.is_closed = True
+        self._close_proc()
+
+    def _close_proc(self) -> None:
+        with self._active_process_lock:
+            proc = self._proc
+            self._proc = None
+            self._inbox = None
+            self._initialized = False
         if proc is None:
             return
         try:
@@ -446,9 +463,17 @@ class JunieACPClient:
             model=model or "junie-acp",
         )
 
-    def _run_prompt(
-        self, prompt_text: str, *, timeout_seconds: float
-    ) -> tuple[str, str, dict[str, dict[str, Any]]]:
+    def _ensure_proc(self) -> subprocess.Popen[str]:
+        """Return a live Junie ACP subprocess, spawning + handshaking on demand.
+
+        The process is REUSED across requests. ``initialize`` is sent exactly
+        once per process; reader threads drain stdout/stderr into a shared inbox.
+        """
+        with self._active_process_lock:
+            proc = self._proc
+            if proc is not None and proc.poll() is None and self._initialized:
+                return proc
+
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -465,150 +490,188 @@ class JunieACPClient:
                 f"Could not start Junie ACP command '{self._acp_command}'. "
                 "Install the JetBrains Junie CLI or set HERMES_JUNIE_ACP_COMMAND/JUNIE_CLI_PATH."
             ) from exc
-
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
             raise RuntimeError("Junie ACP process did not expose stdin/stdout pipes.")
-
-        self.is_closed = False
-        with self._active_process_lock:
-            self._active_process = proc
 
         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=40)
 
         def _stdout_reader() -> None:
-            if proc.stdout is None:
-                return
-            for line in proc.stdout:
+            for line in proc.stdout:  # type: ignore[union-attr]
                 try:
                     inbox.put(json.loads(line))
                 except Exception:
                     inbox.put({"raw": line.rstrip("\n")})
 
         def _stderr_reader() -> None:
-            if proc.stderr is None:
-                return
-            for line in proc.stderr:
+            for line in proc.stderr:  # type: ignore[union-attr]
                 stderr_tail.append(line.rstrip("\n"))
 
-        out_thread = threading.Thread(target=_stdout_reader, daemon=True)
-        err_thread = threading.Thread(target=_stderr_reader, daemon=True)
-        out_thread.start()
-        err_thread.start()
+        threading.Thread(target=_stdout_reader, daemon=True).start()
+        threading.Thread(target=_stderr_reader, daemon=True).start()
 
-        next_id = 0
+        with self._active_process_lock:
+            self._proc = proc
+            self._inbox = inbox
+            self._stderr_tail = stderr_tail
+            self._next_id = 0
+            self._initialized = False
+        self.is_closed = False
 
-        def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None, reasoning_parts: list[str] | None = None, tool_events: dict[str, dict[str, Any]] | None = None) -> Any:
-            nonlocal next_id
-            next_id += 1
-            request_id = next_id
-            payload = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }
-            proc.stdin.write(json.dumps(payload) + "\n")
-            proc.stdin.flush()
+        self._request(
+            "initialize",
+            {
+                "protocolVersion": 1,
+                "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}},
+                "clientInfo": {"name": "hermes-agent", "title": "Hermes Agent", "version": "0.0.0"},
+            },
+            timeout_seconds=60.0,
+        )
+        self._initialized = True
+        return proc
 
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    break
-                try:
-                    msg = inbox.get(timeout=0.1)
-                except queue.Empty:
-                    continue
+    def _request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout_seconds: float,
+        text_parts: list[str] | None = None,
+        reasoning_parts: list[str] | None = None,
+        tool_events: dict[str, dict[str, Any]] | None = None,
+        drain_after: float = 0.0,
+    ) -> Any:
+        proc = self._proc
+        inbox = self._inbox
+        if proc is None or inbox is None or proc.stdin is None:
+            raise RuntimeError("Junie ACP process is not running.")
 
-                if self._handle_server_message(
-                    msg,
-                    process=proc,
-                    cwd=self._acp_cwd,
-                    text_parts=text_parts,
-                    reasoning_parts=reasoning_parts,
-                    tool_events=tool_events,
-                ):
-                    continue
+        self._next_id += 1
+        request_id = self._next_id
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n")
+        proc.stdin.flush()
 
-                if msg.get("id") != request_id:
-                    continue
-                if "error" in msg:
-                    err = msg.get("error") or {}
-                    raise RuntimeError(
-                        f"Junie ACP {method} failed: {err.get('message') or err}"
-                    )
-                return msg.get("result")
+        result: Any = None
+        got = False
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                msg = inbox.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if self._handle_server_message(
+                msg, process=proc, cwd=self._acp_cwd,
+                text_parts=text_parts, reasoning_parts=reasoning_parts, tool_events=tool_events,
+            ):
+                continue
+            if msg.get("id") != request_id:
+                continue
+            if "error" in msg:
+                err = msg.get("error") or {}
+                raise RuntimeError(f"Junie ACP {method} failed: {err.get('message') or err}")
+            result = msg.get("result")
+            got = True
+            break
 
-            stderr_text = "\n".join(stderr_tail).strip()
+        if not got:
+            stderr_text = "\n".join(self._stderr_tail).strip()
             if proc.poll() is not None and stderr_text:
                 raise RuntimeError(f"Junie ACP process exited early: {stderr_text}")
             raise TimeoutError(f"Timed out waiting for Junie ACP response to {method}.")
 
-        try:
-            _request(
-                "initialize",
-                {
-                    "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": {
-                            "readTextFile": True,
-                            "writeTextFile": True,
-                        }
-                    },
-                    "clientInfo": {
-                        "name": "hermes-agent",
-                        "title": "Hermes Agent",
-                        "version": "0.0.0",
-                    },
-                },
+        # The ACP completion signal can arrive before the final
+        # agent_message_chunk and before the task fully finalizes. Draining
+        # until quiescence catches late text AND lets the process settle before
+        # the next session/new (empirically required for reliable multi-turn).
+        if drain_after > 0:
+            self._drain_until_quiet(
+                text_parts=text_parts, reasoning_parts=reasoning_parts,
+                tool_events=tool_events, quiet_gap=1.5, max_wait=drain_after,
             )
-            session = _request(
-                "session/new",
-                {
-                    "cwd": self._acp_cwd,
-                    "mcpServers": [],
-                },
-            ) or {}
-            session_id = str(session.get("sessionId") or "").strip()
-            if not session_id:
-                raise RuntimeError("Junie ACP did not return a sessionId.")
+        return result
 
-            # Optionally force Junie's Brave Mode. configId (not id) is the
-            # required key; verified against the live CLI. Best-effort: a failure
-            # to set it must not abort the prompt.
-            if self._brave_override is not None:
+    def _drain_until_quiet(self, *, text_parts, reasoning_parts, tool_events, quiet_gap, max_wait) -> None:
+        proc = self._proc
+        inbox = self._inbox
+        if proc is None or inbox is None:
+            return
+        hard_deadline = time.monotonic() + max_wait
+        last_msg = time.monotonic()
+        while time.monotonic() < hard_deadline:
+            if proc.poll() is not None:
+                return
+            try:
+                msg = inbox.get(timeout=0.1)
+            except queue.Empty:
+                if time.monotonic() - last_msg >= quiet_gap:
+                    return
+                continue
+            last_msg = time.monotonic()
+            self._handle_server_message(
+                msg, process=proc, cwd=self._acp_cwd,
+                text_parts=text_parts, reasoning_parts=reasoning_parts, tool_events=tool_events,
+            )
+
+    def _run_prompt(
+        self, prompt_text: str, *, timeout_seconds: float
+    ) -> tuple[str, str, dict[str, dict[str, Any]]]:
+        # Serialize requests: one shared stdio pipe + inbox per process.
+        with self._req_lock:
+            last_exc: BaseException | None = None
+            for attempt in (1, 2):
                 try:
-                    _request(
-                        "session/set_config_option",
-                        {"sessionId": session_id, "configId": "brave_mode",
-                         "value": self._brave_override},
+                    self._ensure_proc()
+                    return self._do_turn(prompt_text, timeout_seconds)
+                except (BrokenPipeError, RuntimeError, TimeoutError, OSError) as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "Junie ACP turn failed (attempt %d/2), respawning: %s", attempt, exc
                     )
-                    logger.info("Junie ACP brave_mode set to %s", self._brave_override)
-                except Exception as exc:
-                    logger.warning("Junie ACP set brave_mode failed: %s", exc)
+                    self._close_proc()
+            assert last_exc is not None
+            raise last_exc
 
-            text_parts: list[str] = []
-            reasoning_parts: list[str] = []
-            tool_events: dict[str, dict[str, Any]] = {}
-            _request(
-                "session/prompt",
-                {
-                    "sessionId": session_id,
-                    "prompt": [
-                        {
-                            "type": "text",
-                            "text": prompt_text,
-                        }
-                    ],
-                },
-                text_parts=text_parts,
-                reasoning_parts=reasoning_parts,
-                tool_events=tool_events,
-            )
-            return "".join(text_parts), "".join(reasoning_parts), tool_events
-        finally:
-            self.close()
+    def _do_turn(
+        self, prompt_text: str, timeout_seconds: float
+    ) -> tuple[str, str, dict[str, dict[str, Any]]]:
+        session = self._request(
+            "session/new", {"cwd": self._acp_cwd, "mcpServers": []},
+            timeout_seconds=min(60.0, timeout_seconds),
+        ) or {}
+        session_id = str(session.get("sessionId") or "").strip()
+        if not session_id:
+            raise RuntimeError("Junie ACP did not return a sessionId.")
+
+        # Optionally force Junie's Brave Mode. configId (not id) is the required
+        # key; verified against the live CLI. Best-effort: a set failure must not
+        # abort the prompt.
+        if self._brave_override is not None:
+            try:
+                self._request(
+                    "session/set_config_option",
+                    {"sessionId": session_id, "configId": "brave_mode", "value": self._brave_override},
+                    timeout_seconds=15.0,
+                )
+                logger.info("Junie ACP brave_mode set to %s", self._brave_override)
+            except Exception as exc:
+                logger.warning("Junie ACP set brave_mode failed: %s", exc)
+
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_events: dict[str, dict[str, Any]] = {}
+        self._request(
+            "session/prompt",
+            {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]},
+            timeout_seconds=timeout_seconds,
+            text_parts=text_parts,
+            reasoning_parts=reasoning_parts,
+            tool_events=tool_events,
+            drain_after=min(20.0, timeout_seconds),
+        )
+        return "".join(text_parts), "".join(reasoning_parts), tool_events
 
     def _handle_server_message(
         self,

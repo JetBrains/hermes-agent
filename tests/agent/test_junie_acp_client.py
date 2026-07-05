@@ -309,5 +309,123 @@ class JunieBraveModeTests(unittest.TestCase):
         self.assertIsNone(client._brave_override)
 
 
+class _FakeStdout:
+    """Blocking line iterator fed by the fake process's stdin.write()."""
+    def __init__(self):
+        import queue as _q
+        self.q = _q.Queue()
+    def __iter__(self):
+        return self
+    def __next__(self):
+        item = self.q.get()
+        if item is None:
+            raise StopIteration
+        return item
+
+
+class _FakeStderr:
+    def __iter__(self):
+        return iter(())
+
+
+class _FakeJunieProc:
+    """Minimal in-process fake of `junie --acp=true` speaking line-delimited ACP.
+
+    Lets us prove the client's process-REUSE logic deterministically without a
+    real Junie: one instance answers initialize / many session/new /
+    session/prompt, streaming a text chunk then an end_turn response.
+    """
+    pid = 4242
+
+    def __init__(self):
+        self.stdout = _FakeStdout()
+        self.stderr = _FakeStderr()
+        self.stdin = self
+        self.methods = []
+        self.session_new_count = 0
+        self.prompt_count = 0
+        self._alive = True
+
+    # stdin side
+    def write(self, data):
+        for line in data.splitlines():
+            if not line.strip():
+                continue
+            msg = json.loads(line)
+            method, mid = msg.get("method"), msg.get("id")
+            self.methods.append(method)
+            if method == "initialize":
+                self._emit({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
+            elif method == "session/new":
+                self.session_new_count += 1
+                self._emit({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": f"s{self.session_new_count}"}})
+            elif method == "session/set_config_option":
+                self._emit({"jsonrpc": "2.0", "id": mid, "result": {"configOptions": []}})
+            elif method == "session/prompt":
+                self.prompt_count += 1
+                self._emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": f"ANSWER{self.prompt_count}"}}}})
+                self._emit({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+
+    def flush(self):
+        pass
+
+    def _emit(self, obj):
+        self.stdout.q.put(json.dumps(obj) + "\n")
+
+    # process side
+    def poll(self):
+        return None if self._alive else 0
+    def terminate(self):
+        self._alive = False
+        self.stdout.q.put(None)
+    def wait(self, timeout=None):
+        return 0
+    def kill(self):
+        self.terminate()
+
+
+class JuniePersistentProcessTests(unittest.TestCase):
+    """Feature (a): one subprocess reused across create() calls."""
+
+    def test_process_reused_across_two_calls(self):
+        fake = _FakeJunieProc()
+        with patch("agent.junie_acp_client.subprocess.Popen", return_value=fake) as popen:
+            client = JunieACPClient(acp_cwd="/tmp")
+            r1 = client.chat.completions.create(model="junie-acp", messages=[{"role": "user", "content": "hi 1"}], timeout=5)
+            r2 = client.chat.completions.create(model="junie-acp", messages=[{"role": "user", "content": "hi 2"}], timeout=5)
+
+        # both turns produced their streamed answer
+        self.assertEqual(r1.choices[0].message.content, "ANSWER1")
+        self.assertEqual(r2.choices[0].message.content, "ANSWER2")
+        self.assertEqual(r1.choices[0].finish_reason, "stop")
+        # ONE process spawned for BOTH calls (reuse)
+        self.assertEqual(popen.call_count, 1)
+        # initialize exactly once; a fresh session per request
+        self.assertEqual(fake.methods.count("initialize"), 1)
+        self.assertEqual(fake.session_new_count, 2)
+        self.assertEqual(fake.prompt_count, 2)
+
+    def test_dead_process_is_respawned(self):
+        procs = [_FakeJunieProc(), _FakeJunieProc()]
+        with patch("agent.junie_acp_client.subprocess.Popen", side_effect=procs) as popen:
+            client = JunieACPClient(acp_cwd="/tmp")
+            r1 = client.chat.completions.create(model="junie-acp", messages=[{"role": "user", "content": "x"}], timeout=5)
+            self.assertEqual(r1.choices[0].message.content, "ANSWER1")
+            # simulate the process dying between calls
+            procs[0]._alive = False
+            r2 = client.chat.completions.create(model="junie-acp", messages=[{"role": "user", "content": "y"}], timeout=5)
+        self.assertEqual(r2.choices[0].message.content, "ANSWER1")  # fresh proc's first prompt
+        self.assertEqual(popen.call_count, 2)  # respawned
+
+    def test_brave_override_sends_set_config_option(self):
+        fake = _FakeJunieProc()
+        with patch("agent.junie_acp_client.subprocess.Popen", return_value=fake):
+            client = JunieACPClient(acp_cwd="/tmp", brave_mode=False)
+            client.chat.completions.create(model="junie-acp", messages=[{"role": "user", "content": "x"}], timeout=5)
+        self.assertIn("session/set_config_option", fake.methods)
+
+
 if __name__ == "__main__":
     unittest.main()
