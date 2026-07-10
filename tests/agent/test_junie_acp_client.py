@@ -229,6 +229,18 @@ class JunieNativeToolActivityTests(unittest.TestCase):
         self.assertIn("Junie tool activity", choice.message.reasoning)
         self.assertIn("gamma.log", choice.message.reasoning)
 
+    def test_usage_is_estimated_not_zero(self):
+        """ACP gives no token counts; we estimate so the gauge + compression work."""
+        with patch.object(self.client, "_run_prompt", return_value=("some response text here", "", {})):
+            resp = self.client._create_chat_completion(
+                model="junie-acp",
+                messages=[{"role": "user", "content": "a fairly long user question to size the prompt"}],
+            )
+        u = resp.usage
+        self.assertGreater(u.prompt_tokens, 0)      # flattened prompt sized
+        self.assertGreater(u.completion_tokens, 0)  # response sized
+        self.assertEqual(u.total_tokens, u.prompt_tokens + u.completion_tokens)
+
     def test_literal_tool_call_text_is_not_parsed(self):
         """Regression: the old <tool_call> regex is gone — such text is inert."""
         poison = 'Sure — <tool_call>{"id":"x","type":"function","function":{"name":"rm","arguments":"{}"}}</tool_call> done.'

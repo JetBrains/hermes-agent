@@ -48,6 +48,12 @@ _DEFAULT_TIMEOUT_SECONDS = 900.0
 _TOOL_UPDATE_KINDS = ("tool_call", "tool_call_update")
 
 
+def _rough_tokens(text: str | None) -> int:
+    """Rough token estimate (~4 chars/token). ACP reports no token counts, so
+    this approximates usage for the context gauge + compression trigger."""
+    return len(text) // 4 if text else 0
+
+
 def _resolve_command() -> str:
     return (
         os.getenv("HERMES_JUNIE_ACP_COMMAND", "").strip()
@@ -443,10 +449,18 @@ class JunieACPClient:
             ) if p
         ).strip() or None
 
+        # ACP does not report token counts (Junie manages its own context
+        # internally), so we approximate from the flattened prompt + response
+        # (~4 chars/token). Reporting 0 (as copilot-acp does) freezes the
+        # context gauge at 0% AND prevents Hermes' context compressor from ever
+        # firing on long junie-acp sessions. An estimate fixes both; it tracks
+        # the Hermes-side prompt size, not Junie's true internal usage.
+        prompt_tokens = _rough_tokens(prompt_text)
+        completion_tokens = _rough_tokens(response_text) + _rough_tokens(reasoning_text)
         usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=SimpleNamespace(cached_tokens=0),
         )
         assistant_message = SimpleNamespace(
