@@ -47,6 +47,13 @@ _DEFAULT_TIMEOUT_SECONDS = 900.0
 # to fabricate OpenAI tool_calls (see JunieACPClient._create_chat_completion).
 _TOOL_UPDATE_KINDS = ("tool_call", "tool_call_update")
 
+# Model values that mean "let Junie use its own default" — the provider
+# sentinel/aliases, not real Junie model ids. These are NOT forwarded to
+# session/set_config_option{model}.
+_MODEL_PASSTHROUGH_SENTINELS = frozenset({
+    "junie-acp", "junie", "jetbrains-junie-acp", "junie-acp-agent", "",
+})
+
 
 def _rough_tokens(text: str | None) -> int:
     """Rough token estimate (~4 chars/token). ACP reports no token counts, so
@@ -429,6 +436,7 @@ class JunieACPClient:
         response_text, reasoning_text, tool_events = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
+            model=model,
         )
 
         # Junie executes its own tools and reports them as completed activity;
@@ -630,7 +638,7 @@ class JunieACPClient:
             )
 
     def _run_prompt(
-        self, prompt_text: str, *, timeout_seconds: float
+        self, prompt_text: str, *, timeout_seconds: float, model: str | None = None
     ) -> tuple[str, str, dict[str, dict[str, Any]]]:
         # Serialize requests: one shared stdio pipe + inbox per process.
         with self._req_lock:
@@ -638,7 +646,7 @@ class JunieACPClient:
             for attempt in (1, 2):
                 try:
                     self._ensure_proc()
-                    return self._do_turn(prompt_text, timeout_seconds)
+                    return self._do_turn(prompt_text, timeout_seconds, model=model)
                 except (BrokenPipeError, RuntimeError, TimeoutError, OSError) as exc:
                     last_exc = exc
                     logger.warning(
@@ -649,7 +657,7 @@ class JunieACPClient:
             raise last_exc
 
     def _do_turn(
-        self, prompt_text: str, timeout_seconds: float
+        self, prompt_text: str, timeout_seconds: float, model: str | None = None
     ) -> tuple[str, str, dict[str, dict[str, Any]]]:
         session = self._request(
             "session/new", {"cwd": self._acp_cwd, "mcpServers": []},
@@ -658,6 +666,23 @@ class JunieACPClient:
         session_id = str(session.get("sessionId") or "").strip()
         if not session_id:
             raise RuntimeError("Junie ACP did not return a sessionId.")
+
+        # Forward the requested model to Junie via its ACP config. Skip the
+        # "junie-acp" provider sentinel / aliases (those mean "use Junie's own
+        # default"); only real Junie model ids (gemini-3-flash-preview,
+        # claude-opus-4-8, gpt-5.x, …) are set. Best-effort: an unknown id or a
+        # set failure must not abort the prompt.
+        requested = (model or "").strip()
+        if requested and requested.lower() not in _MODEL_PASSTHROUGH_SENTINELS:
+            try:
+                self._request(
+                    "session/set_config_option",
+                    {"sessionId": session_id, "configId": "model", "value": requested},
+                    timeout_seconds=15.0,
+                )
+                logger.info("Junie ACP model set to %s", requested)
+            except Exception as exc:
+                logger.warning("Junie ACP set model %s failed: %s", requested, exc)
 
         # Optionally force Junie's Brave Mode. configId (not id) is the required
         # key; verified against the live CLI. Best-effort: a set failure must not

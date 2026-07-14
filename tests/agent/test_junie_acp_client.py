@@ -354,6 +354,7 @@ class _FakeJunieProc:
         self.stderr = _FakeStderr()
         self.stdin = self
         self.methods = []
+        self.config_sets = []   # (configId, value) for each session/set_config_option
         self.session_new_count = 0
         self.prompt_count = 0
         self._alive = True
@@ -372,6 +373,8 @@ class _FakeJunieProc:
                 self.session_new_count += 1
                 self._emit({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": f"s{self.session_new_count}"}})
             elif method == "session/set_config_option":
+                p = msg.get("params") or {}
+                self.config_sets.append((p.get("configId"), p.get("value")))
                 self._emit({"jsonrpc": "2.0", "id": mid, "result": {"configOptions": []}})
             elif method == "session/prompt":
                 self.prompt_count += 1
@@ -436,7 +439,21 @@ class JuniePersistentProcessTests(unittest.TestCase):
         with patch("agent.junie_acp_client.subprocess.Popen", return_value=fake):
             client = JunieACPClient(acp_cwd="/tmp", brave_mode=False)
             client.chat.completions.create(model="junie-acp", messages=[{"role": "user", "content": "x"}], timeout=5)
-        self.assertIn("session/set_config_option", fake.methods)
+        self.assertIn(("brave_mode", False), fake.config_sets)
+
+    def test_real_model_is_forwarded_via_set_config_option(self):
+        fake = _FakeJunieProc()
+        with patch("agent.junie_acp_client.subprocess.Popen", return_value=fake):
+            client = JunieACPClient(acp_cwd="/tmp")
+            client.chat.completions.create(model="claude-opus-4-8", messages=[{"role": "user", "content": "x"}], timeout=5)
+        self.assertIn(("model", "claude-opus-4-8"), fake.config_sets)
+
+    def test_provider_sentinel_model_is_not_forwarded(self):
+        fake = _FakeJunieProc()
+        with patch("agent.junie_acp_client.subprocess.Popen", return_value=fake):
+            client = JunieACPClient(acp_cwd="/tmp")
+            client.chat.completions.create(model="junie-acp", messages=[{"role": "user", "content": "x"}], timeout=5)
+        self.assertFalse([c for c in fake.config_sets if c[0] == "model"])
 
 
 if __name__ == "__main__":
