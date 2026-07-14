@@ -32,11 +32,12 @@ def test_junie_aliases_resolve(alias):
     assert full is not None
 
 
-def test_junie_acp_curated_models_present():
+def test_junie_acp_curated_models_is_sentinel_only():
+    # Like copilot-acp: only the provider sentinel, so detect_provider_for_model
+    # doesn't mis-resolve real claude/gemini/gpt ids to junie-acp. A specific
+    # model is passed with -m and forwarded to Junie, not drawn from this list.
     models = [m for m, _label in M.curated_models_for_provider("junie-acp")]
-    assert "junie-acp" in models  # provider-default sentinel
-    assert any(m.startswith("gemini") or m.startswith("claude") or m.startswith("gpt")
-               for m in models)
+    assert models == ["junie-acp"]
 
 
 def test_junie_acp_provider_model_ids():

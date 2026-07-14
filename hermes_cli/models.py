@@ -273,20 +273,14 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "copilot-acp": [
         "copilot-acp",
     ],
-    # Junie picks its own model via the ACP session's configOptions; the model
-    # Hermes sends is only a hint. These are the model IDs Junie exposes today
-    # (see `junie --acp=true` session/new configOptions). "junie-acp" is the
-    # provider-default sentinel that lets Junie use its own configured default.
+    # Only the provider sentinel — like copilot-acp. Junie picks its own model
+    # via ACP configOptions; a specific model is passed with `-m <id>` and
+    # forwarded verbatim (session/set_config_option{model}), NOT drawn from this
+    # list. Listing real ids here would make detect_provider_for_model()
+    # mis-resolve claude/gemini/gpt models to junie-acp (breaks anthropic/openai
+    # resolution — see the gateway/detect tests).
     "junie-acp": [
         "junie-acp",
-        "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite",
-        "claude-sonnet-5",
-        "claude-opus-4-8",
-        "claude-fable-5",
-        "gpt-5.4",
-        "gpt-5.5",
-        "grok-4.3",
     ],
     "copilot": [
         "gpt-5.4",
