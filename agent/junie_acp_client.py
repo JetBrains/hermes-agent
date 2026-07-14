@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 ACP_MARKER_BASE_URL = "acp://junie"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
+# Used when the caller passes an explicit "no timeout" (httpx.Timeout(None)):
+# a long-but-finite ceiling so a legitimate long coding run isn't cut at 900s
+# but a truly hung subprocess still eventually unblocks.
+_NO_TIMEOUT_FALLBACK_SECONDS = 3600.0
 
 # Junie's ACP session/update kinds that report tool activity. Unlike an OpenAI
 # model, Junie is an autonomous agent that EXECUTES its own tools and reports
@@ -165,13 +169,23 @@ def _permission_response(message_id: Any, params: dict[str, Any], *, policy: str
     tool_call = params.get("toolCall") or {}
     title = tool_call.get("title") or tool_call.get("toolCallId") or "?"
     if policy == "allow":
-        for opt in params.get("options") or []:
-            if isinstance(opt, dict) and str(opt.get("kind", "")).lower() in _ALLOW_OPTION_KINDS:
-                option_id = opt.get("optionId") or opt.get("id")
-                if option_id:
-                    logger.info("Junie ACP permission ALLOW: %s (option=%s)", title, option_id)
-                    return {"jsonrpc": "2.0", "id": message_id,
-                            "result": {"outcome": {"outcome": "selected", "optionId": option_id}}}
+        options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
+        # "allow" means approve *once*: prefer an allow_once option and only fall
+        # back to allow_always if the request offers no single-shot option — never
+        # grant persistent auto-approval just because it happened to be listed first.
+        chosen = None
+        for kind in ("allow_once", "allow_always"):
+            for opt in options:
+                if str(opt.get("kind", "")).lower() == kind:
+                    chosen = opt.get("optionId") or opt.get("id")
+                    if chosen:
+                        break
+            if chosen:
+                break
+        if chosen:
+            logger.info("Junie ACP permission ALLOW: %s (option=%s)", title, chosen)
+            return {"jsonrpc": "2.0", "id": message_id,
+                    "result": {"outcome": {"outcome": "selected", "optionId": chosen}}}
     logger.info("Junie ACP permission DENY: %s (policy=%s)", title, policy)
     return {"jsonrpc": "2.0", "id": message_id, "result": {"outcome": {"outcome": "cancelled"}}}
 
@@ -248,6 +262,18 @@ def _render_message_content(content: Any) -> str:
                     parts.append(text.strip())
         return "\n".join(parts).strip()
     return str(content).strip()
+
+
+def _chunk_text(content: Any) -> str:
+    """Extract text from a session/update content that may be a dict or a list
+    of {type,text} blocks."""
+    if isinstance(content, dict):
+        return str(content.get("text") or "")
+    if isinstance(content, list):
+        return "".join(
+            str(b.get("text") or "") for b in content if isinstance(b, dict)
+        )
+    return ""
 
 
 def _tool_update_text(update: dict[str, Any]) -> str:
@@ -377,6 +403,9 @@ class JunieACPClient:
         self._stderr_tail: deque[str] = deque(maxlen=40)
         self._next_id = 0
         self._initialized = False
+        # True once session/prompt has been dispatched this turn — gates the
+        # no-replay retry policy (Junie may already have applied side effects).
+        self._prompt_in_flight = False
         self._req_lock = threading.Lock()
         self._active_process_lock = threading.Lock()
 
@@ -431,7 +460,10 @@ class JunieACPClient:
                 for attr in ("read", "write", "connect", "pool", "timeout")
             ]
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
-            _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
+            # An httpx.Timeout with every component None means "no timeout".
+            # Don't collapse that to the short default (which would abort a long
+            # Junie coding run); use a generous ceiling instead.
+            _effective_timeout = max(_numeric) if _numeric else _NO_TIMEOUT_FALLBACK_SECONDS
 
         response_text, reasoning_text, tool_events = self._run_prompt(
             prompt_text,
@@ -563,6 +595,7 @@ class JunieACPClient:
         reasoning_parts: list[str] | None = None,
         tool_events: dict[str, dict[str, Any]] | None = None,
         drain_after: float = 0.0,
+        session_id: str | None = None,
     ) -> Any:
         proc = self._proc
         inbox = self._inbox
@@ -587,6 +620,7 @@ class JunieACPClient:
             if self._handle_server_message(
                 msg, process=proc, cwd=self._acp_cwd,
                 text_parts=text_parts, reasoning_parts=reasoning_parts, tool_events=tool_events,
+                session_id=session_id,
             ):
                 continue
             if msg.get("id") != request_id:
@@ -611,11 +645,12 @@ class JunieACPClient:
         if drain_after > 0:
             self._drain_until_quiet(
                 text_parts=text_parts, reasoning_parts=reasoning_parts,
-                tool_events=tool_events, quiet_gap=1.5, max_wait=drain_after,
+                tool_events=tool_events, quiet_gap=2.5, max_wait=drain_after,
+                session_id=session_id,
             )
         return result
 
-    def _drain_until_quiet(self, *, text_parts, reasoning_parts, tool_events, quiet_gap, max_wait) -> None:
+    def _drain_until_quiet(self, *, text_parts, reasoning_parts, tool_events, quiet_gap, max_wait, session_id=None) -> None:
         proc = self._proc
         inbox = self._inbox
         if proc is None or inbox is None:
@@ -635,6 +670,7 @@ class JunieACPClient:
             self._handle_server_message(
                 msg, process=proc, cwd=self._acp_cwd,
                 text_parts=text_parts, reasoning_parts=reasoning_parts, tool_events=tool_events,
+                session_id=session_id,
             )
 
     def _run_prompt(
@@ -644,15 +680,24 @@ class JunieACPClient:
         with self._req_lock:
             last_exc: BaseException | None = None
             for attempt in (1, 2):
+                self._prompt_in_flight = False
                 try:
                     self._ensure_proc()
                     return self._do_turn(prompt_text, timeout_seconds, model=model)
                 except (BrokenPipeError, RuntimeError, TimeoutError, OSError) as exc:
                     last_exc = exc
-                    logger.warning(
-                        "Junie ACP turn failed (attempt %d/2), respawning: %s", attempt, exc
-                    )
                     self._close_proc()
+                    # Junie is autonomous: once session/prompt is dispatched it may
+                    # already have edited files / run commands. Never replay a
+                    # dispatched prompt — that would double-apply side effects.
+                    # Only retry failures that happened BEFORE the prompt was sent
+                    # (e.g. a stale reused subprocess died on session/new).
+                    if self._prompt_in_flight:
+                        logger.warning("Junie ACP turn failed after prompt dispatch; not retrying: %s", exc)
+                        raise
+                    logger.warning(
+                        "Junie ACP turn failed before prompt (attempt %d/2), respawning: %s", attempt, exc
+                    )
             assert last_exc is not None
             raise last_exc
 
@@ -701,6 +746,9 @@ class JunieACPClient:
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_events: dict[str, dict[str, Any]] = {}
+        # Mark dispatch so _run_prompt won't replay a prompt Junie may have
+        # already acted on (see the retry guard).
+        self._prompt_in_flight = True
         self._request(
             "session/prompt",
             {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]},
@@ -709,6 +757,7 @@ class JunieACPClient:
             reasoning_parts=reasoning_parts,
             tool_events=tool_events,
             drain_after=min(20.0, timeout_seconds),
+            session_id=session_id,
         )
         return "".join(text_parts), "".join(reasoning_parts), tool_events
 
@@ -721,6 +770,7 @@ class JunieACPClient:
         text_parts: list[str] | None,
         reasoning_parts: list[str] | None,
         tool_events: dict[str, dict[str, Any]] | None = None,
+        session_id: str | None = None,
     ) -> bool:
         method = msg.get("method")
         if not isinstance(method, str):
@@ -728,6 +778,15 @@ class JunieACPClient:
 
         if method == "session/update":
             params = msg.get("params") or {}
+            # One reused process serves many sessions over one shared inbox.
+            # Drop updates belonging to a *different* session (e.g. a straggler
+            # chunk from a previous turn), so a prior answer can't leak into this
+            # turn's text. When session_id is None (initialize/session/new phase)
+            # we don't filter.
+            if session_id is not None:
+                upd_sid = str(params.get("sessionId") or "").strip()
+                if upd_sid and upd_sid != session_id:
+                    return True
             update = params.get("update") or {}
             kind = str(update.get("sessionUpdate") or "").strip()
             if kind in _TOOL_UPDATE_KINDS:
@@ -736,11 +795,9 @@ class JunieACPClient:
                 if tool_events is not None:
                     _merge_tool_update(tool_events, update)
                 return True
-            # agent_message_chunk / agent_thought_chunk carry a dict content.
-            content = update.get("content") or {}
-            chunk_text = ""
-            if isinstance(content, dict):
-                chunk_text = str(content.get("text") or "")
+            # agent_message_chunk / agent_thought_chunk content may be a dict
+            # ({"type":"text","text":...}) or a list of such blocks.
+            chunk_text = _chunk_text(update.get("content"))
             if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
                 text_parts.append(chunk_text)
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
@@ -767,10 +824,14 @@ class JunieACPClient:
                     content = ""
                 line = params.get("line")
                 limit = params.get("limit")
-                if isinstance(line, int) and line > 1:
+                has_line = isinstance(line, int) and line > 1
+                has_limit = isinstance(limit, int) and limit > 0
+                if has_line or has_limit:
+                    # Honor `limit` even when reading from the top (line 1/absent),
+                    # otherwise a paginated read returns the whole file.
                     lines = content.splitlines(keepends=True)
-                    start = line - 1
-                    end = start + limit if isinstance(limit, int) and limit > 0 else None
+                    start = line - 1 if has_line else 0
+                    end = start + limit if has_limit else None
                     content = "".join(lines[start:end])
                 if content:
                     content = redact_sensitive_text(content, force=True)

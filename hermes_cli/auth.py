@@ -6329,8 +6329,14 @@ _EXTERNAL_PROCESS_SPECS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def _resolve_external_process_launch(provider_id: str) -> Dict[str, Any]:
-    """Resolve command + args (incl. injected auth) for a subprocess provider."""
+def _resolve_external_process_launch(provider_id: str, *, include_auth: bool = True) -> Dict[str, Any]:
+    """Resolve command + args for a subprocess provider.
+
+    ``include_auth=True`` injects the auth token into args (for the actual
+    subprocess launch). ``include_auth=False`` omits it — use for status /
+    display paths so the secret never lands in a dict that might be logged or
+    serialized.
+    """
     spec = _EXTERNAL_PROCESS_SPECS.get(provider_id, _EXTERNAL_PROCESS_SPECS["copilot-acp"])
     command = ""
     for env_var in spec["command_env_vars"]:
@@ -6344,7 +6350,7 @@ def _resolve_external_process_launch(provider_id: str) -> Dict[str, Any]:
     args = shlex.split(raw_args) if raw_args else list(spec["default_args"])
 
     auth_flag = spec.get("auth_flag")
-    if auth_flag and auth_flag not in args and not any(
+    if include_auth and auth_flag and auth_flag not in args and not any(
         a.startswith(f"{auth_flag}=") for a in args
     ):
         for env_var in spec.get("auth_env_vars", ()):
@@ -6361,7 +6367,8 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    launch = _resolve_external_process_launch(provider_id)
+    # Status is a display/serialization surface — never embed the auth token.
+    launch = _resolve_external_process_launch(provider_id, include_auth=False)
     command = launch["command"]
     args = launch["args"]
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""

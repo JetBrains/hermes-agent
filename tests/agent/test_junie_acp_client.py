@@ -114,6 +114,20 @@ class JunieACPClientSafetyTests(unittest.TestCase):
         self.assertNotIn("abc123def456", content)
         self.assertIn("OPENAI_API_KEY=", content)
 
+    def test_read_text_file_honors_limit_at_top(self) -> None:
+        """A paginated read from line 1 must respect `limit`, not return the whole file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            f = root / "big.txt"
+            f.write_text("".join(f"line{i}\n" for i in range(100)))
+            with patch("agent.redact._REDACT_ENABLED", False):
+                resp = self._dispatch(
+                    {"jsonrpc": "2.0", "id": 9, "method": "fs/read_text_file",
+                     "params": {"path": str(f), "line": 1, "limit": 3}},
+                    cwd=str(root),
+                )
+        self.assertEqual(resp["result"]["content"], "line0\nline1\nline2\n")
+
     def test_write_text_file_respects_safe_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -286,6 +300,20 @@ class JuniePermissionPolicyTests(unittest.TestCase):
         resp = json.loads(process.stdin.getvalue().strip())
         self.assertEqual(resp["result"]["outcome"]["outcome"], "cancelled")
 
+    def test_allow_prefers_allow_once_over_allow_always(self):
+        """`allow` = approve once: never pick allow_always just because it's first."""
+        client = JunieACPClient(acp_cwd="/tmp", permission_policy="allow")
+        req = json.loads(json.dumps(_GOLDEN_PERMISSION_REQUEST))
+        req["params"]["options"] = [
+            {"optionId": "always", "kind": "allow_always"},   # listed first
+            {"optionId": "once", "kind": "allow_once"},
+        ]
+        process = _FakeProcess()
+        client._handle_server_message(req, process=process, cwd="/tmp",
+                                      text_parts=[], reasoning_parts=[], tool_events={})
+        resp = json.loads(process.stdin.getvalue().strip())
+        self.assertEqual(resp["result"]["outcome"]["optionId"], "once")
+
     def test_default_policy_is_deny(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(_resolve_permission_policy(), "deny")
@@ -360,7 +388,9 @@ class _FakeJunieProc:
         self._alive = True
 
     # stdin side
-    fail_model_set = False  # when True, error on session/set_config_option{model}
+    fail_model_set = False    # when True, error on session/set_config_option{model}
+    fail_prompt = False       # when True, error on session/prompt
+    fail_session_new = False  # when True, error on session/new
 
     def write(self, data):
         for line in data.splitlines():
@@ -378,6 +408,10 @@ class _FakeJunieProc:
                 self._emit({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
             elif method == "session/new":
                 self.session_new_count += 1
+                if self.fail_session_new:
+                    self._emit({"jsonrpc": "2.0", "id": mid,
+                                "error": {"code": -32000, "message": "stale session/new"}})
+                    continue
                 self._emit({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": f"s{self.session_new_count}"}})
             elif method == "session/set_config_option":
                 p = msg.get("params") or {}
@@ -385,6 +419,10 @@ class _FakeJunieProc:
                 self._emit({"jsonrpc": "2.0", "id": mid, "result": {"configOptions": []}})
             elif method == "session/prompt":
                 self.prompt_count += 1
+                if self.fail_prompt:
+                    self._emit({"jsonrpc": "2.0", "id": mid,
+                                "error": {"code": -32000, "message": "prompt failed mid-turn"}})
+                    continue
                 self._emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
                     "sessionUpdate": "agent_message_chunk",
                     "content": {"type": "text", "text": f"ANSWER{self.prompt_count}"}}}})
@@ -473,6 +511,67 @@ class JuniePersistentProcessTests(unittest.TestCase):
             resp = client.chat.completions.create(model="no-such-model", messages=[{"role": "user", "content": "x"}], timeout=5)
         self.assertEqual(resp.choices[0].message.content, "ANSWER1")   # prompt still ran
         self.assertEqual(resp.choices[0].finish_reason, "stop")
+
+    def test_no_replay_after_prompt_dispatch(self):
+        """A failure once session/prompt is dispatched must NOT be retried —
+        Junie may already have applied side effects (see the retry guard)."""
+        fake = _FakeJunieProc()
+        fake.fail_prompt = True
+        with patch("agent.junie_acp_client.subprocess.Popen", return_value=fake) as popen:
+            client = JunieACPClient(acp_cwd="/tmp")
+            with self.assertRaises(RuntimeError):
+                client.chat.completions.create(model="junie-acp", messages=[{"role": "user", "content": "x"}], timeout=5)
+        self.assertEqual(fake.prompt_count, 1)   # dispatched exactly once, not replayed
+        self.assertEqual(popen.call_count, 1)     # no respawn after dispatch
+
+    def test_retry_before_prompt_respawns(self):
+        """A failure BEFORE the prompt is sent (stale reused process dies on
+        session/new) IS safe to retry on a fresh process."""
+        bad, good = _FakeJunieProc(), _FakeJunieProc()
+        bad.fail_session_new = True
+        with patch("agent.junie_acp_client.subprocess.Popen", side_effect=[bad, good]) as popen:
+            client = JunieACPClient(acp_cwd="/tmp")
+            resp = client.chat.completions.create(model="junie-acp", messages=[{"role": "user", "content": "x"}], timeout=5)
+        self.assertEqual(resp.choices[0].message.content, "ANSWER1")
+        self.assertEqual(popen.call_count, 2)     # respawned and succeeded
+        self.assertEqual(good.prompt_count, 1)
+
+
+class JunieMessageHandlingTests(unittest.TestCase):
+    """Fixes: cross-session filtering + list-form chunk extraction."""
+
+    def setUp(self):
+        self.client = JunieACPClient(acp_cwd="/tmp")
+
+    def _update(self, session_id, sess_in_msg, content, kind="agent_message_chunk"):
+        params = {"update": {"sessionUpdate": kind, "content": content}}
+        if sess_in_msg is not None:
+            params["sessionId"] = sess_in_msg
+        text = []
+        self.client._handle_server_message(
+            {"jsonrpc": "2.0", "method": "session/update", "params": params},
+            process=_FakeProcess(), cwd="/tmp",
+            text_parts=text, reasoning_parts=[], tool_events={}, session_id=session_id,
+        )
+        return text
+
+    def test_stale_session_update_is_dropped(self):
+        # update tagged with a different sessionId must not leak into this turn
+        text = self._update("current", "OTHER", {"type": "text", "text": "leak"})
+        self.assertEqual(text, [])
+
+    def test_matching_session_update_is_kept(self):
+        text = self._update("current", "current", {"type": "text", "text": "ok"})
+        self.assertEqual(text, ["ok"])
+
+    def test_untagged_update_is_kept(self):
+        # no sessionId in the message (Junie's current form) → not filtered
+        text = self._update("current", None, {"type": "text", "text": "ok"})
+        self.assertEqual(text, ["ok"])
+
+    def test_list_form_chunk_content_is_extracted(self):
+        text = self._update("s", None, [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])
+        self.assertEqual(text, ["ab"])
 
 
 if __name__ == "__main__":

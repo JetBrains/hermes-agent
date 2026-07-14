@@ -270,6 +270,7 @@ _PROVIDER_ALIASES = {
     # JetBrains Junie (ACP coding agent)
     "jetbrains-junie-acp": "junie-acp",
     "junie-acp-agent": "junie-acp",
+    "junie": "junie-acp",
     "tencent": "tencent-tokenhub",
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
