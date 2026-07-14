@@ -360,6 +360,8 @@ class _FakeJunieProc:
         self._alive = True
 
     # stdin side
+    fail_model_set = False  # when True, error on session/set_config_option{model}
+
     def write(self, data):
         for line in data.splitlines():
             if not line.strip():
@@ -367,6 +369,11 @@ class _FakeJunieProc:
             msg = json.loads(line)
             method, mid = msg.get("method"), msg.get("id")
             self.methods.append(method)
+            if method == "session/set_config_option" and self.fail_model_set \
+                    and (msg.get("params") or {}).get("configId") == "model":
+                self._emit({"jsonrpc": "2.0", "id": mid,
+                            "error": {"code": -32602, "message": "unknown model"}})
+                continue
             if method == "initialize":
                 self._emit({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
             elif method == "session/new":
@@ -449,11 +456,23 @@ class JuniePersistentProcessTests(unittest.TestCase):
         self.assertIn(("model", "claude-opus-4-8"), fake.config_sets)
 
     def test_provider_sentinel_model_is_not_forwarded(self):
+        for sentinel in ("junie-acp", "junie", "jetbrains-junie-acp", "junie-acp-agent", ""):
+            fake = _FakeJunieProc()
+            with patch("agent.junie_acp_client.subprocess.Popen", return_value=fake):
+                client = JunieACPClient(acp_cwd="/tmp")
+                client.chat.completions.create(model=sentinel, messages=[{"role": "user", "content": "x"}], timeout=5)
+            self.assertFalse([c for c in fake.config_sets if c[0] == "model"],
+                             f"sentinel {sentinel!r} should not set a model")
+
+    def test_model_set_failure_does_not_abort_turn(self):
+        """Best-effort: an unknown/rejected model id still completes the prompt."""
         fake = _FakeJunieProc()
+        fake.fail_model_set = True
         with patch("agent.junie_acp_client.subprocess.Popen", return_value=fake):
             client = JunieACPClient(acp_cwd="/tmp")
-            client.chat.completions.create(model="junie-acp", messages=[{"role": "user", "content": "x"}], timeout=5)
-        self.assertFalse([c for c in fake.config_sets if c[0] == "model"])
+            resp = client.chat.completions.create(model="no-such-model", messages=[{"role": "user", "content": "x"}], timeout=5)
+        self.assertEqual(resp.choices[0].message.content, "ANSWER1")   # prompt still ran
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
 
 
 if __name__ == "__main__":
