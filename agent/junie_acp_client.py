@@ -5,29 +5,38 @@ chat-style backend. Each request starts a short-lived ACP session, sends the
 formatted conversation as a single prompt, collects text chunks, and converts
 the result back into the minimal shape Hermes expects from an OpenAI client.
 
-It is a deliberate, standalone fork of ``agent/copilot_acp_client.py`` — kept
-independent so upstream changes to the Copilot path cannot break Junie.
+The JSON-RPC / stdio plumbing is delegated to the official Agent Client
+Protocol Python SDK (``agent-client-protocol``): Hermes acts as an ACP *client*
+(:class:`acp.ClientSideConnection`) driving the Junie agent subprocess, and a
+small :class:`_HermesClient` implements the client-side callbacks (fs reads/
+writes, permission prompts, and streamed ``session/update`` notifications).
+
+The SDK is asyncio-native, but Hermes calls ``chat.completions.create`` on a
+synchronous code path (see ``agent/chat_completion_helpers.py``). We therefore
+own a dedicated asyncio event loop on a background daemon thread and bridge each
+request with :func:`asyncio.run_coroutine_threadsafe`.
 
 Junie specifics (vs Copilot):
   * launched as ``junie --acp=true`` (Copilot uses ``copilot --acp --stdio``);
   * auth is supplied via ``--auth <token>`` / ``JUNIE_API_KEY`` rather than
     being wholly owned by the CLI;
   * Junie wraps each JSON-RPC message with an extra
-    ``"type": "com.agentclientprotocol.rpc.*"`` envelope field, which is
-    harmless — messages are matched by ``id`` / ``method`` as usual.
+    ``"type": "com.agentclientprotocol.rpc.*"`` envelope field, which the SDK's
+    parser simply ignores (messages are matched by ``id`` / ``method``).
 """
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import contextlib
 import json
 import logging
 import os
-import queue
+from collections import deque
 import shlex
-import subprocess
 import threading
 import time
-from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -37,12 +46,55 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+# The ACP SDK is an optional dependency (the ``acp`` extra). Import lazily-ish:
+# module import must succeed for the pure helpers below (imported by tests and
+# by callers that only touch resolution logic), but actually driving a Junie
+# subprocess requires the SDK. ``_require_acp`` raises a clear, actionable error
+# when it is missing.
+try:  # pragma: no cover - trivial import guard
+    import acp as _acp  # noqa: N813
+    from acp.exceptions import RequestError
+    from acp.schema import (
+        AllowedOutcome,
+        ClientCapabilities,
+        DeniedOutcome,
+        FileSystemCapabilities,
+        Implementation,
+        ReadTextFileResponse,
+        RequestPermissionResponse,
+    )
+
+    _ACP_IMPORT_ERROR: Exception | None = None
+except Exception as _exc:  # pragma: no cover - only hit without the extra
+    _acp = None  # type: ignore[assignment]
+    _ACP_IMPORT_ERROR = _exc
+
+
 ACP_MARKER_BASE_URL = "acp://junie"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 # Used when the caller passes an explicit "no timeout" (httpx.Timeout(None)):
 # a long-but-finite ceiling so a legitimate long coding run isn't cut at 900s
 # but a truly hung subprocess still eventually unblocks.
 _NO_TIMEOUT_FALLBACK_SECONDS = 3600.0
+# Handshake (JVM cold start) can be slow; give initialize/session-setup room.
+_HANDSHAKE_TIMEOUT_SECONDS = 90.0
+# Per-call caps inside a turn so a wedged (but still "alive") reused process
+# fails fast on session/new — recovering on a fresh process — instead of
+# hanging the whole request until the outer turn timeout.
+_SESSION_NEW_TIMEOUT_SECONDS = 60.0
+_CONFIG_OPTION_TIMEOUT_SECONDS = 15.0
+# stdin reader buffer for the agent subprocess. Junie streams large tool_call
+# payloads (file contents) on a single line; the SDK default (64KB) would raise
+# LimitOverrunError, so match the SDK's own 50MB ceiling for multimodal data.
+_STDIO_LIMIT_BYTES = 50 * 1024 * 1024
+# After session/prompt returns, wait until Junie has been quiet for this long
+# before finalizing — the ACP completion response can precede a trailing
+# agent_message_chunk / task finalization, and the latency that matters is the
+# real subprocess stdout-flush / GC delay (NOT in-process dispatch), so keep the
+# original conservative gap. Capped by ``_SETTLE_MAX_SECONDS``. Tests override
+# both to tiny values (see tests/agent/test_junie_acp_client.py:_make_client).
+_SETTLE_QUIET_GAP_SECONDS = 2.5
+_SETTLE_MAX_SECONDS = 20.0
 
 # Junie's ACP session/update kinds that report tool activity. Unlike an OpenAI
 # model, Junie is an autonomous agent that EXECUTES its own tools and reports
@@ -58,10 +110,35 @@ _MODEL_PASSTHROUGH_SENTINELS = frozenset({
     "junie-acp", "junie", "jetbrains-junie-acp", "junie-acp-agent", "",
 })
 
+# Prefer approving *once*: only grant persistent auto-approval if a request
+# offers no single-shot option (see _choose_permission_option).
+_ALLOW_OPTION_KINDS = ("allow_once", "allow_always")
+
+
+def _client_capabilities() -> Any:
+    """The ClientCapabilities Hermes advertises to Junie (fs on, no terminal)."""
+    return ClientCapabilities(
+        fs=FileSystemCapabilities(read_text_file=True, write_text_file=True),
+        terminal=False,
+    )
+
+
+def _client_info() -> Any:
+    return Implementation(name="hermes-agent", title="Hermes Agent", version="0.0.0")
+
+
+def _require_acp() -> None:
+    if _acp is None:
+        raise RuntimeError(
+            "The Agent Client Protocol SDK is required for the junie-acp provider. "
+            "Install it with `pip install 'hermes-agent[acp]'` (or "
+            "`pip install agent-client-protocol`)."
+        ) from _ACP_IMPORT_ERROR
+
 
 def _rough_tokens(text: str | None) -> int:
-    """Rough token estimate (~4 chars/token). ACP reports no token counts, so
-    this approximates usage for the context gauge + compression trigger."""
+    """Rough token estimate (~4 chars/token). Used only as a fallback when
+    Junie does not report usage; see JunieACPClient._create_chat_completion."""
     return len(text) // 4 if text else 0
 
 
@@ -144,50 +221,24 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
-def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
-    return {
-        "jsonrpc": "2.0",
-        "id": message_id,
-        "error": {
-            "code": code,
-            "message": message,
-        },
-    }
+def _choose_permission_option(options: list[dict[str, Any]], policy: str) -> str | None:
+    """Pick the optionId to approve for a session/request_permission request.
 
-
-_ALLOW_OPTION_KINDS = ("allow_once", "allow_always")
-
-
-def _permission_response(message_id: Any, params: dict[str, Any], *, policy: str) -> dict[str, Any]:
-    """Answer a session/request_permission request per ``policy``.
-
-    ACP outcomes: ``{"outcome": {"outcome": "selected", "optionId": ...}}`` to
-    approve (we pick an allow-kind option the request offered), or
-    ``{"outcome": {"outcome": "cancelled"}}`` to reject. A request with no
-    allow option (or ``policy="deny"``) is always cancelled.
+    Returns None to reject (``policy="deny"`` or no allow-kind option offered).
+    "allow" means approve *once*: prefer an allow_once option and only fall back
+    to allow_always if the request offers no single-shot option — never grant
+    persistent auto-approval just because it happened to be listed first.
     """
-    tool_call = params.get("toolCall") or {}
-    title = tool_call.get("title") or tool_call.get("toolCallId") or "?"
-    if policy == "allow":
-        options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
-        # "allow" means approve *once*: prefer an allow_once option and only fall
-        # back to allow_always if the request offers no single-shot option — never
-        # grant persistent auto-approval just because it happened to be listed first.
-        chosen = None
-        for kind in ("allow_once", "allow_always"):
-            for opt in options:
-                if str(opt.get("kind", "")).lower() == kind:
-                    chosen = opt.get("optionId") or opt.get("id")
-                    if chosen:
-                        break
-            if chosen:
-                break
-        if chosen:
-            logger.info("Junie ACP permission ALLOW: %s (option=%s)", title, chosen)
-            return {"jsonrpc": "2.0", "id": message_id,
-                    "result": {"outcome": {"outcome": "selected", "optionId": chosen}}}
-    logger.info("Junie ACP permission DENY: %s (policy=%s)", title, policy)
-    return {"jsonrpc": "2.0", "id": message_id, "result": {"outcome": {"outcome": "cancelled"}}}
+    if policy != "allow":
+        return None
+    opts = [o for o in options if isinstance(o, dict)]
+    for kind in _ALLOW_OPTION_KINDS:
+        for opt in opts:
+            if str(opt.get("kind", "")).lower() == kind:
+                chosen = opt.get("optionId") or opt.get("id")
+                if chosen:
+                    return str(chosen)
+    return None
 
 
 def _format_messages_as_prompt(
@@ -348,6 +399,243 @@ def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
     return resolved
 
 
+def _read_text_file_content(
+    path_text: str, cwd: str, *, line: int | None, limit: int | None
+) -> str:
+    """Safely read a file for an fs/read_text_file request.
+
+    Enforces path-within-cwd, honors Hermes' read-blocklist, redacts secrets,
+    and applies ACP line/limit pagination (honoring ``limit`` even from the top
+    so a paginated read doesn't return the whole file).
+    """
+    path = _ensure_path_within_cwd(path_text, cwd)
+    block_error = get_read_block_error(str(path))
+    if block_error:
+        raise PermissionError(block_error)
+    try:
+        content = path.read_text()
+    except FileNotFoundError:
+        content = ""
+    has_line = isinstance(line, int) and line > 1
+    has_limit = isinstance(limit, int) and limit > 0
+    if has_line or has_limit:
+        lines = content.splitlines(keepends=True)
+        start = line - 1 if has_line else 0
+        end = start + limit if has_limit else None
+        content = "".join(lines[start:end])
+    if content:
+        content = redact_sensitive_text(content, force=True)
+    return content
+
+
+def _write_text_file(path_text: str, cwd: str, content: str) -> None:
+    """Safely write a file for an fs/write_text_file request.
+
+    Enforces path-within-cwd and Hermes' write-deny policy (protected
+    system/credential files).
+    """
+    path = _ensure_path_within_cwd(path_text, cwd)
+    if is_write_denied(str(path)):
+        raise PermissionError(
+            f"Write denied: '{path}' is a protected system/credential file."
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+# --------------------------------------------------------------------------- #
+# Live model discovery for the /model picker                                  #
+# --------------------------------------------------------------------------- #
+# Junie advertises its selectable models in the session/new response's
+# ``config_options`` (the ``model`` Select option). Discovering them live keeps
+# the picker in sync with whatever the account/CLI actually offers, without
+# hardcoding ids into _PROVIDER_MODELS (which would make detect_provider_for_model
+# mis-resolve claude/gemini/gpt ids to junie-acp). Cached because each probe
+# spawns Junie (JVM cold start).
+_MODEL_CACHE_TTL_SECONDS = 6 * 3600
+# Negative results (unauthed / offline / timeout) are cached in-memory only, for
+# a short window, so a wedged /model picker doesn't re-spawn Junie on every open
+# — but a fresh process (or a re-auth after this window) re-probes promptly.
+_MODEL_NEG_TTL_SECONDS = 300
+# key -> (ts, ids); an empty ids list is a cached negative result.
+_model_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+def _account_fingerprint(args: list[str]) -> str:
+    """Short, non-reversible tag for the Junie account behind these args.
+
+    Keys the model cache so switching accounts (different --auth token /
+    JUNIE_API_KEY) doesn't serve the previous account's catalog. Only the hash
+    is ever stored — never the raw token, on disk or in memory.
+    """
+    import hashlib
+
+    token = ""
+    for i, a in enumerate(args):
+        if a == "--auth" and i + 1 < len(args):
+            token = args[i + 1]
+            break
+        if a.startswith("--auth="):
+            token = a.split("=", 1)[1]
+            break
+    if not token:
+        token = os.getenv("JUNIE_API_KEY", "").strip()
+    if not token:
+        return "noauth"
+    return hashlib.sha256(token.encode("utf-8", "ignore")).hexdigest()[:12]
+
+
+def _model_cache_key(command: str, args: list[str]) -> str:
+    return f"{command}#{_account_fingerprint(args)}"
+
+
+def _extract_model_ids(config_options: Any) -> list[str]:
+    """Pull the ``model`` config option's advertised value ids (current first)."""
+    for opt in config_options or []:
+        data = opt.model_dump(by_alias=True, exclude_none=True) if hasattr(opt, "model_dump") else dict(opt)
+        if data.get("id") != "model" and data.get("configId") != "model":
+            continue
+        ids: list[str] = []
+        for o in data.get("options") or []:
+            if isinstance(o, dict):
+                val = o.get("value") or o.get("valueId") or o.get("optionId")
+                if val:
+                    ids.append(str(val))
+        current = data.get("currentValue")
+        if current and current in ids:
+            ids = [current] + [i for i in ids if i != current]
+        return ids
+    return []
+
+
+def _model_disk_cache_path() -> Path:
+    from hermes_constants import get_hermes_home
+    return Path(get_hermes_home()) / "junie_acp_models_cache.json"
+
+
+def _load_model_disk_cache(key: str) -> tuple[float, list[str]] | None:
+    """Return ``(stored_ts, ids)`` for ``key`` or None. Freshness is judged by
+    the caller against the original timestamp (so loading never re-stamps the
+    TTL). Only positive (non-empty) results are ever on disk."""
+    try:
+        path = _model_disk_cache_path()
+        if not path.exists():
+            return None
+        blob = json.loads(path.read_text())
+        entry = blob.get(key)
+        if not entry:
+            return None
+        ids = entry.get("ids")
+        if not (isinstance(ids, list) and ids):
+            return None
+        return float(entry.get("ts", 0)), [str(i) for i in ids]
+    except Exception:
+        return None
+
+
+def _save_model_disk_cache(key: str, ids: list[str]) -> None:
+    # ``key`` = "<command>#<account-hash>": never persists the raw --auth token.
+    # Negatives are NOT written (they live in-memory only) so a fresh process
+    # after re-auth re-probes immediately instead of honoring a stale miss.
+    if not ids:
+        return
+    try:
+        path = _model_disk_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        blob = {}
+        if path.exists():
+            with contextlib.suppress(Exception):
+                blob = json.loads(path.read_text())
+        if not isinstance(blob, dict):
+            blob = {}
+        blob[key] = {"ts": time.time(), "ids": ids}
+        path.write_text(json.dumps(blob))
+    except Exception:
+        pass
+
+
+async def _afetch_junie_models(command: str, args: list[str], cwd: str) -> list[str]:
+    handler = _HermesClient(cwd=cwd, permission_policy="deny")
+    async with contextlib.AsyncExitStack() as stack:
+        conn, _proc = await stack.enter_async_context(
+            _acp.spawn_agent_process(
+                handler, command, *args,
+                env=_build_subprocess_env(), cwd=cwd,
+                transport_kwargs={"limit": _STDIO_LIMIT_BYTES},
+            )
+        )
+        await conn.initialize(
+            protocol_version=_acp.PROTOCOL_VERSION,
+            client_capabilities=_client_capabilities(),
+            client_info=_client_info(),
+        )
+        session = await conn.new_session(cwd=cwd, mcp_servers=[])
+        return _extract_model_ids(getattr(session, "config_options", None))
+
+
+def fetch_junie_models(
+    *,
+    command: str | None = None,
+    args: list[str] | None = None,
+    cwd: str | None = None,
+    timeout: float = 20.0,
+    force_refresh: bool = False,
+) -> list[str] | None:
+    """Return the models Junie advertises over ACP, or None if unavailable.
+
+    Spawns ``junie --acp=true`` and reads the ``model`` config option from the
+    session/new response. Positive results are cached in-memory + on disk (6h,
+    keyed per account); failures (SDK missing, CLI absent, not authed, timeout)
+    return None and are negatively cached in-memory for a short window so the
+    /model picker doesn't re-spawn a JVM on every open. Callers fall back to the
+    curated sentinel list on None.
+    """
+    if _acp is None:
+        return None
+    command = command or _resolve_command()
+    args = list(args if args is not None else _resolve_args())
+    cwd = str(Path(cwd or os.getcwd()).resolve())
+    key = _model_cache_key(command, args)
+    now = time.time()
+
+    def _fresh(ts: float, ids: list[str]) -> bool:
+        ttl = _MODEL_CACHE_TTL_SECONDS if ids else _MODEL_NEG_TTL_SECONDS
+        return (now - ts) < ttl
+
+    if not force_refresh:
+        mem = _model_cache.get(key)
+        if mem and _fresh(*mem):
+            return mem[1] or None
+        disk = _load_model_disk_cache(key)  # positives only; original ts preserved
+        if disk and _fresh(*disk):
+            _model_cache[key] = disk  # keep the disk timestamp — don't re-stamp the TTL
+            return disk[1] or None
+
+    async def _runner() -> list[str]:
+        return await asyncio.wait_for(_afetch_junie_models(command, args, cwd), timeout)
+
+    try:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            ids = asyncio.run(_runner())
+        else:
+            # Called from within a running loop: run on a private loop thread.
+            # (This still blocks the caller — provider_model_ids is a sync API —
+            # but avoids the "asyncio.run() inside a running loop" error.)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                ids = ex.submit(lambda: asyncio.run(_runner())).result(timeout + 5)
+    except Exception as exc:
+        logger.debug("fetch_junie_models failed: %s", exc)
+        ids = []  # negative cache below so we don't re-spawn Junie every open
+
+    _model_cache[key] = (time.time(), ids)
+    if ids:
+        _save_model_disk_cache(key, ids)
+        return ids
+    return None
+
+
 class _ACPChatCompletions:
     def __init__(self, client: "JunieACPClient"):
         self._client = client
@@ -359,6 +647,120 @@ class _ACPChatCompletions:
 class _ACPChatNamespace:
     def __init__(self, client: "JunieACPClient"):
         self.completions = _ACPChatCompletions(client)
+
+
+class _HermesClient:
+    """Client-side ACP callbacks Hermes exposes to the Junie agent.
+
+    Implements the parts of :class:`acp.Client` that Junie exercises: streamed
+    ``session/update`` notifications (text / thought / tool activity), the
+    ``session/request_permission`` prompt, and sandboxed ``fs/read_text_file`` /
+    ``fs/write_text_file``. Terminal methods are intentionally unimplemented —
+    the SDK router treats them as optional and returns a null default.
+
+    One instance is reused across turns on the client's event loop; per-turn
+    collection buffers are installed by :meth:`begin_turn` and cleared by
+    :meth:`end_turn`, so notifications are single-threaded on that loop and need
+    no locking.
+    """
+
+    def __init__(self, *, cwd: str, permission_policy: str):
+        self._cwd = cwd
+        self._policy = permission_policy
+        self._session_id: str | None = None
+        self._text_parts: list[str] | None = None
+        self._reasoning_parts: list[str] | None = None
+        self._tool_events: dict[str, dict[str, Any]] | None = None
+        self._last_activity = 0.0
+
+    def begin_turn(
+        self,
+        session_id: str,
+        text_parts: list[str],
+        reasoning_parts: list[str],
+        tool_events: dict[str, dict[str, Any]],
+    ) -> None:
+        self._session_id = session_id
+        self._text_parts = text_parts
+        self._reasoning_parts = reasoning_parts
+        self._tool_events = tool_events
+        self._last_activity = time.monotonic()
+
+    def end_turn(self) -> None:
+        self._session_id = None
+        self._text_parts = None
+        self._reasoning_parts = None
+        self._tool_events = None
+
+    async def settle(self, quiet_gap: float, max_wait: float) -> None:
+        """Wait until Junie has been quiet for ``quiet_gap`` (capped at
+        ``max_wait``) so a trailing chunk after the completion isn't lost."""
+        if max_wait <= 0:
+            return
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            if time.monotonic() - self._last_activity >= quiet_gap:
+                return
+            await asyncio.sleep(0.05)
+
+    async def session_update(self, session_id: str, update: Any, **_: Any) -> None:
+        # One reused process serves many sessions over one connection. Drop
+        # updates belonging to a *different* session (e.g. a straggler chunk
+        # from a previous turn) so a prior answer can't leak into this turn.
+        if self._session_id is not None and session_id and session_id != self._session_id:
+            return
+        self._last_activity = time.monotonic()
+        data = update.model_dump(by_alias=True, exclude_none=True) if hasattr(update, "model_dump") else dict(update)
+        kind = str(data.get("sessionUpdate") or "").strip()
+        if kind in _TOOL_UPDATE_KINDS:
+            # Native structured tool activity — captured for observability, NOT
+            # turned into OpenAI tool_calls.
+            if self._tool_events is not None:
+                _merge_tool_update(self._tool_events, data)
+            return
+        chunk_text = _chunk_text(data.get("content"))
+        if kind == "agent_message_chunk" and chunk_text and self._text_parts is not None:
+            self._text_parts.append(chunk_text)
+        elif kind == "agent_thought_chunk" and chunk_text and self._reasoning_parts is not None:
+            self._reasoning_parts.append(chunk_text)
+
+    async def request_permission(
+        self, options: list[Any], session_id: str, tool_call: Any, **_: Any
+    ) -> Any:
+        opt_dicts = [
+            (o.model_dump(by_alias=True, exclude_none=True) if hasattr(o, "model_dump") else dict(o))
+            for o in (options or [])
+        ]
+        tc = tool_call.model_dump(by_alias=True, exclude_none=True) if hasattr(tool_call, "model_dump") else dict(tool_call or {})
+        title = tc.get("title") or tc.get("toolCallId") or "?"
+        chosen = _choose_permission_option(opt_dicts, self._policy)
+        if chosen:
+            logger.info("Junie ACP permission ALLOW: %s (option=%s)", title, chosen)
+            return RequestPermissionResponse(outcome=AllowedOutcome(option_id=chosen, outcome="selected"))
+        logger.info("Junie ACP permission DENY: %s (policy=%s)", title, self._policy)
+        return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+
+    async def read_text_file(
+        self, path: str, session_id: str, limit: int | None = None, line: int | None = None, **_: Any
+    ) -> Any:
+        try:
+            content = _read_text_file_content(path, self._cwd, line=line, limit=limit)
+        except Exception as exc:
+            raise RequestError.invalid_params({"details": str(exc)}) from exc
+        return ReadTextFileResponse(content=content)
+
+    async def write_text_file(self, content: str, path: str, session_id: str, **_: Any) -> None:
+        try:
+            _write_text_file(path, self._cwd, content or "")
+        except Exception as exc:
+            raise RequestError.invalid_params({"details": str(exc)}) from exc
+        return None
+
+    async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        raise RequestError.method_not_found(method)
+
+    async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
+        return None
 
 
 class JunieACPClient:
@@ -390,45 +792,167 @@ class JunieACPClient:
         self._brave_override = brave_mode if brave_mode is not None else _resolve_brave_override()
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
+
         # Persistent subprocess reused across requests (avoids Junie/JVM cold
         # start on every Hermes step). One process handles many independent
         # sessions; we open a fresh session per request and re-send the full
         # transcript, so we never rely on Junie's cross-turn memory matching
-        # Hermes' history (no divergence risk). Verified: one process serves
-        # multiple session/new, and draining until quiescence after a prompt
-        # response is required before the next turn (the ACP completion signal
-        # can precede trailing text / task finalization).
-        self._proc: subprocess.Popen[str] | None = None
-        self._inbox: queue.Queue[dict[str, Any]] | None = None
-        self._stderr_tail: deque[str] = deque(maxlen=40)
-        self._next_id = 0
+        # Hermes' history (no divergence risk).
+        self._handler = _HermesClient(cwd=self._acp_cwd, permission_policy=self._permission_policy)
+        # SDK objects live on a dedicated event loop running on a daemon thread.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread: threading.Thread | None = None
+        self._conn: Any = None  # acp.ClientSideConnection
+        self._proc: Any = None  # asyncio subprocess.Process
+        self._exit_stack: contextlib.AsyncExitStack | None = None
         self._initialized = False
+        # Last lines of the subprocess's stderr, surfaced in failure messages so
+        # a crash/auth-rejection gives an actionable reason (not an opaque
+        # timeout/connection error).
+        self._stderr_tail: deque[str] = deque(maxlen=40)
+        # Overridable for tests (fast settle); production keeps the safe gap.
+        self._settle_quiet_gap = _SETTLE_QUIET_GAP_SECONDS
+        self._settle_max = _SETTLE_MAX_SECONDS
         # True once session/prompt has been dispatched this turn — gates the
         # no-replay retry policy (Junie may already have applied side effects).
         self._prompt_in_flight = False
         self._req_lock = threading.Lock()
-        self._active_process_lock = threading.Lock()
+
+    # ---- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
         self.is_closed = True
-        self._close_proc()
-
-    def _close_proc(self) -> None:
-        with self._active_process_lock:
-            proc = self._proc
-            self._proc = None
-            self._inbox = None
-            self._initialized = False
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
             try:
-                proc.kill()
+                self._submit(self._aclose_proc(), timeout=5.0)
             except Exception:
                 pass
+            loop.call_soon_threadsafe(loop.stop)
+        thread = self._loop_thread
+        if thread is not None:
+            thread.join(timeout=3.0)
+        if loop is not None and not loop.is_closed() and not (thread and thread.is_alive()):
+            # Release the loop's selector/selfpipe fds once its thread has
+            # stopped (avoids ResourceWarning: unclosed event loop).
+            with contextlib.suppress(Exception):
+                loop.close()
+        self._loop = None
+        self._loop_thread = None
+
+    def _stderr_suffix(self) -> str:
+        text = "\n".join(self._stderr_tail).strip()
+        return f" (Junie stderr: {text})" if text else ""
+
+    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        loop = self._loop
+        if loop is not None and not loop.is_closed() and self._loop_thread and self._loop_thread.is_alive():
+            return loop
+        _require_acp()
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, name="junie-acp-loop", daemon=True)
+        thread.start()
+        self._loop = loop
+        self._loop_thread = thread
+        return loop
+
+    def _submit(self, coro: Any, *, timeout: float) -> Any:
+        """Run ``coro`` on the background loop and block until it finishes."""
+        loop = self._loop
+        if loop is None:
+            raise RuntimeError("Junie ACP event loop is not running.")
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            return future.result(timeout)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise TimeoutError("Timed out waiting for the Junie ACP subprocess.") from exc
+
+    async def _aensure_proc(self) -> None:
+        """Spawn + handshake the Junie subprocess on demand, reusing a live one."""
+        if (
+            self._conn is not None
+            and self._proc is not None
+            and getattr(self._proc, "returncode", 0) is None
+            and self._initialized
+        ):
+            return
+
+        await self._aclose_proc()
+
+        stack = contextlib.AsyncExitStack()
+        try:
+            conn, proc = await stack.enter_async_context(
+                _acp.spawn_agent_process(
+                    self._handler,
+                    self._acp_command,
+                    *self._acp_args,
+                    env=_build_subprocess_env(),
+                    cwd=self._acp_cwd,
+                    transport_kwargs={"limit": _STDIO_LIMIT_BYTES},
+                )
+            )
+        except FileNotFoundError as exc:
+            await stack.aclose()
+            raise RuntimeError(
+                f"Could not start Junie ACP command '{self._acp_command}'. "
+                "Install the JetBrains Junie CLI or set HERMES_JUNIE_ACP_COMMAND/JUNIE_CLI_PATH."
+            ) from exc
+
+        self._exit_stack = stack
+        self._conn = conn
+        self._proc = proc
+        self._stderr_tail = deque(maxlen=40)
+        if getattr(proc, "stderr", None) is not None:
+            asyncio.ensure_future(self._adrain_stderr(proc))
+        # If the subprocess dies (crash / self-exit), close the connection so any
+        # in-flight request is rejected promptly instead of blocking until the
+        # turn's wall-clock timeout. The SDK rejects outstanding futures on
+        # close(); a clean stdout EOF alone would not.
+        asyncio.ensure_future(self._awatch_proc(proc, conn))
+        await conn.initialize(
+            protocol_version=_acp.PROTOCOL_VERSION,
+            client_capabilities=_client_capabilities(),
+            client_info=_client_info(),
+        )
+        self._initialized = True
+        self.is_closed = False
+
+    async def _adrain_stderr(self, proc: Any) -> None:
+        stream = getattr(proc, "stderr", None)
+        if stream is None:
+            return
+        try:
+            async for raw in stream:
+                line = raw.decode("utf-8", "replace").rstrip("\n") if isinstance(raw, (bytes, bytearray)) else str(raw).rstrip("\n")
+                if line:
+                    self._stderr_tail.append(line)
+        except Exception:
+            return
+
+    async def _awatch_proc(self, proc: Any, conn: Any) -> None:
+        try:
+            await proc.wait()
+        except Exception:
+            return
+        # Only tear down if this is still the active process (a respawn may have
+        # already replaced it).
+        if conn is self._conn:
+            self._initialized = False
+        with contextlib.suppress(Exception):
+            await conn.close()
+
+    async def _aclose_proc(self) -> None:
+        self._initialized = False
+        stack = self._exit_stack
+        self._exit_stack = None
+        self._conn = None
+        self._proc = None
+        if stack is not None:
+            with contextlib.suppress(Exception):
+                await stack.aclose()
+
+    # ---- request path ------------------------------------------------------
 
     def _create_chat_completion(
         self,
@@ -453,19 +977,15 @@ class JunieACPClient:
         elif isinstance(timeout, (int, float)):
             _effective_timeout = float(timeout)
         else:
-            # httpx.Timeout or similar — pick the largest component so the
-            # subprocess has enough wall-clock time for the full response.
             _candidates = [
                 getattr(timeout, attr, None)
                 for attr in ("read", "write", "connect", "pool", "timeout")
             ]
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             # An httpx.Timeout with every component None means "no timeout".
-            # Don't collapse that to the short default (which would abort a long
-            # Junie coding run); use a generous ceiling instead.
             _effective_timeout = max(_numeric) if _numeric else _NO_TIMEOUT_FALLBACK_SECONDS
 
-        response_text, reasoning_text, tool_events = self._run_prompt(
+        response_text, reasoning_text, tool_events, usage_obj = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
             model=model,
@@ -489,20 +1009,7 @@ class JunieACPClient:
             ) if p
         ).strip() or None
 
-        # ACP does not report token counts (Junie manages its own context
-        # internally), so we approximate from the flattened prompt + response
-        # (~4 chars/token). Reporting 0 (as copilot-acp does) freezes the
-        # context gauge at 0% AND prevents Hermes' context compressor from ever
-        # firing on long junie-acp sessions. An estimate fixes both; it tracks
-        # the Hermes-side prompt size, not Junie's true internal usage.
-        prompt_tokens = _rough_tokens(prompt_text)
-        completion_tokens = _rough_tokens(response_text) + _rough_tokens(reasoning_text)
-        usage = SimpleNamespace(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-        )
+        usage = self._build_usage(prompt_text, response_text, reasoning_text, usage_obj)
         assistant_message = SimpleNamespace(
             content=response_text.strip(),
             tool_calls=[],
@@ -517,176 +1024,51 @@ class JunieACPClient:
             model=model or "junie-acp",
         )
 
-    def _ensure_proc(self) -> subprocess.Popen[str]:
-        """Return a live Junie ACP subprocess, spawning + handshaking on demand.
-
-        The process is REUSED across requests. ``initialize`` is sent exactly
-        once per process; reader threads drain stdout/stderr into a shared inbox.
-        """
-        with self._active_process_lock:
-            proc = self._proc
-            if proc is not None and proc.poll() is None and self._initialized:
-                return proc
-
-        try:
-            proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not start Junie ACP command '{self._acp_command}'. "
-                "Install the JetBrains Junie CLI or set HERMES_JUNIE_ACP_COMMAND/JUNIE_CLI_PATH."
-            ) from exc
-        if proc.stdin is None or proc.stdout is None:
-            proc.kill()
-            raise RuntimeError("Junie ACP process did not expose stdin/stdout pipes.")
-
-        inbox: queue.Queue[dict[str, Any]] = queue.Queue()
-        stderr_tail: deque[str] = deque(maxlen=40)
-
-        def _stdout_reader() -> None:
-            for line in proc.stdout:  # type: ignore[union-attr]
-                try:
-                    inbox.put(json.loads(line))
-                except Exception:
-                    inbox.put({"raw": line.rstrip("\n")})
-
-        def _stderr_reader() -> None:
-            for line in proc.stderr:  # type: ignore[union-attr]
-                stderr_tail.append(line.rstrip("\n"))
-
-        threading.Thread(target=_stdout_reader, daemon=True).start()
-        threading.Thread(target=_stderr_reader, daemon=True).start()
-
-        with self._active_process_lock:
-            self._proc = proc
-            self._inbox = inbox
-            self._stderr_tail = stderr_tail
-            self._next_id = 0
-            self._initialized = False
-        self.is_closed = False
-
-        self._request(
-            "initialize",
-            {
-                "protocolVersion": 1,
-                "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}},
-                "clientInfo": {"name": "hermes-agent", "title": "Hermes Agent", "version": "0.0.0"},
-            },
-            timeout_seconds=60.0,
+    @staticmethod
+    def _build_usage(
+        prompt_text: str, response_text: str, reasoning_text: str, usage_obj: Any
+    ) -> SimpleNamespace:
+        """Prefer Junie's own token counts (PromptResponse.usage) and fall back
+        to a ~4-chars/token estimate. ACP historically reported no counts, which
+        froze the context gauge at 0% and starved the compressor; either source
+        keeps both working."""
+        prompt_tokens = completion_tokens = cached = 0
+        if usage_obj is not None:
+            prompt_tokens = int(getattr(usage_obj, "input_tokens", 0) or 0)
+            completion_tokens = int(getattr(usage_obj, "output_tokens", 0) or 0)
+            completion_tokens += int(getattr(usage_obj, "thought_tokens", 0) or 0)
+            cached = int(getattr(usage_obj, "cached_read_tokens", 0) or 0)
+        if prompt_tokens <= 0 and completion_tokens <= 0:
+            prompt_tokens = _rough_tokens(prompt_text)
+            completion_tokens = _rough_tokens(response_text) + _rough_tokens(reasoning_text)
+        return SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
         )
-        self._initialized = True
-        return proc
-
-    def _request(
-        self,
-        method: str,
-        params: dict[str, Any],
-        *,
-        timeout_seconds: float,
-        text_parts: list[str] | None = None,
-        reasoning_parts: list[str] | None = None,
-        tool_events: dict[str, dict[str, Any]] | None = None,
-        drain_after: float = 0.0,
-        session_id: str | None = None,
-    ) -> Any:
-        proc = self._proc
-        inbox = self._inbox
-        if proc is None or inbox is None or proc.stdin is None:
-            raise RuntimeError("Junie ACP process is not running.")
-
-        self._next_id += 1
-        request_id = self._next_id
-        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n")
-        proc.stdin.flush()
-
-        result: Any = None
-        got = False
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                break
-            try:
-                msg = inbox.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if self._handle_server_message(
-                msg, process=proc, cwd=self._acp_cwd,
-                text_parts=text_parts, reasoning_parts=reasoning_parts, tool_events=tool_events,
-                session_id=session_id,
-            ):
-                continue
-            if msg.get("id") != request_id:
-                continue
-            if "error" in msg:
-                err = msg.get("error") or {}
-                raise RuntimeError(f"Junie ACP {method} failed: {err.get('message') or err}")
-            result = msg.get("result")
-            got = True
-            break
-
-        if not got:
-            stderr_text = "\n".join(self._stderr_tail).strip()
-            if proc.poll() is not None and stderr_text:
-                raise RuntimeError(f"Junie ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Junie ACP response to {method}.")
-
-        # The ACP completion signal can arrive before the final
-        # agent_message_chunk and before the task fully finalizes. Draining
-        # until quiescence catches late text AND lets the process settle before
-        # the next session/new (empirically required for reliable multi-turn).
-        if drain_after > 0:
-            self._drain_until_quiet(
-                text_parts=text_parts, reasoning_parts=reasoning_parts,
-                tool_events=tool_events, quiet_gap=2.5, max_wait=drain_after,
-                session_id=session_id,
-            )
-        return result
-
-    def _drain_until_quiet(self, *, text_parts, reasoning_parts, tool_events, quiet_gap, max_wait, session_id=None) -> None:
-        proc = self._proc
-        inbox = self._inbox
-        if proc is None or inbox is None:
-            return
-        hard_deadline = time.monotonic() + max_wait
-        last_msg = time.monotonic()
-        while time.monotonic() < hard_deadline:
-            if proc.poll() is not None:
-                return
-            try:
-                msg = inbox.get(timeout=0.1)
-            except queue.Empty:
-                if time.monotonic() - last_msg >= quiet_gap:
-                    return
-                continue
-            last_msg = time.monotonic()
-            self._handle_server_message(
-                msg, process=proc, cwd=self._acp_cwd,
-                text_parts=text_parts, reasoning_parts=reasoning_parts, tool_events=tool_events,
-                session_id=session_id,
-            )
 
     def _run_prompt(
         self, prompt_text: str, *, timeout_seconds: float, model: str | None = None
-    ) -> tuple[str, str, dict[str, dict[str, Any]]]:
-        # Serialize requests: one shared stdio pipe + inbox per process.
+    ) -> tuple[str, str, dict[str, dict[str, Any]], Any]:
+        # Serialize requests: one shared connection + process.
         with self._req_lock:
+            self._ensure_loop()
             last_exc: BaseException | None = None
             for attempt in (1, 2):
                 self._prompt_in_flight = False
                 try:
-                    self._ensure_proc()
-                    return self._do_turn(prompt_text, timeout_seconds, model=model)
-                except (BrokenPipeError, RuntimeError, TimeoutError, OSError) as exc:
+                    self._submit(self._aensure_proc(), timeout=_HANDSHAKE_TIMEOUT_SECONDS)
+                    # Give the turn a bit more wall-clock than the prompt itself
+                    # so the post-prompt settle can complete before we bail.
+                    turn_timeout = timeout_seconds + self._settle_max + 5.0
+                    return self._submit(
+                        self._ado_turn(prompt_text, timeout_seconds, model=model),
+                        timeout=turn_timeout,
+                    )
+                except (TimeoutError, RuntimeError, OSError, ConnectionError) as exc:
                     last_exc = exc
-                    self._close_proc()
+                    self._safe_close_proc()
                     # Junie is autonomous: once session/prompt is dispatched it may
                     # already have edited files / run commands. Never replay a
                     # dispatched prompt — that would double-apply side effects.
@@ -698,17 +1080,38 @@ class JunieACPClient:
                     logger.warning(
                         "Junie ACP turn failed before prompt (attempt %d/2), respawning: %s", attempt, exc
                     )
+                except Exception as exc:
+                    # RequestError (SDK) and any other agent-side failure.
+                    last_exc = exc
+                    self._safe_close_proc()
+                    if self._prompt_in_flight:
+                        logger.warning("Junie ACP turn failed after prompt dispatch; not retrying: %s", exc)
+                        raise RuntimeError(f"Junie ACP prompt failed: {exc}{self._stderr_suffix()}") from exc
+                    logger.warning(
+                        "Junie ACP turn failed before prompt (attempt %d/2), respawning: %s", attempt, exc
+                    )
             assert last_exc is not None
+            # Exhausted the pre-prompt retries — surface Junie's stderr (auth
+            # rejection, missing runtime, …) so the failure is actionable.
+            suffix = self._stderr_suffix()
+            if suffix:
+                raise RuntimeError(f"Junie ACP failed to start: {last_exc}{suffix}") from last_exc
             raise last_exc
 
-    def _do_turn(
+    def _safe_close_proc(self) -> None:
+        with contextlib.suppress(Exception):
+            self._submit(self._aclose_proc(), timeout=5.0)
+
+    async def _ado_turn(
         self, prompt_text: str, timeout_seconds: float, model: str | None = None
-    ) -> tuple[str, str, dict[str, dict[str, Any]]]:
-        session = self._request(
-            "session/new", {"cwd": self._acp_cwd, "mcpServers": []},
-            timeout_seconds=min(60.0, timeout_seconds),
-        ) or {}
-        session_id = str(session.get("sessionId") or "").strip()
+    ) -> tuple[str, str, dict[str, dict[str, Any]], Any]:
+        # Cap session/new so a wedged-but-alive reused process fails fast here
+        # (pre-prompt → safe to respawn+retry) instead of hanging the whole turn.
+        session = await asyncio.wait_for(
+            self._conn.new_session(cwd=self._acp_cwd, mcp_servers=[]),
+            min(_SESSION_NEW_TIMEOUT_SECONDS, timeout_seconds),
+        )
+        session_id = str(getattr(session, "session_id", "") or "").strip()
         if not session_id:
             raise RuntimeError("Junie ACP did not return a sessionId.")
 
@@ -720,24 +1123,23 @@ class JunieACPClient:
         requested = (model or "").strip()
         if requested and requested.lower() not in _MODEL_PASSTHROUGH_SENTINELS:
             try:
-                self._request(
-                    "session/set_config_option",
-                    {"sessionId": session_id, "configId": "model", "value": requested},
-                    timeout_seconds=15.0,
+                await asyncio.wait_for(
+                    self._conn.set_config_option(config_id="model", session_id=session_id, value=requested),
+                    _CONFIG_OPTION_TIMEOUT_SECONDS,
                 )
                 logger.info("Junie ACP model set to %s", requested)
             except Exception as exc:
                 logger.warning("Junie ACP set model %s failed: %s", requested, exc)
 
-        # Optionally force Junie's Brave Mode. configId (not id) is the required
-        # key; verified against the live CLI. Best-effort: a set failure must not
-        # abort the prompt.
+        # Optionally force Junie's Brave Mode. Junie accepts a boolean
+        # (true -> ON, false -> OFF) for backward compatibility; best-effort.
         if self._brave_override is not None:
             try:
-                self._request(
-                    "session/set_config_option",
-                    {"sessionId": session_id, "configId": "brave_mode", "value": self._brave_override},
-                    timeout_seconds=15.0,
+                await asyncio.wait_for(
+                    self._conn.set_config_option(
+                        config_id="brave_mode", session_id=session_id, value=bool(self._brave_override)
+                    ),
+                    _CONFIG_OPTION_TIMEOUT_SECONDS,
                 )
                 logger.info("Junie ACP brave_mode set to %s", self._brave_override)
             except Exception as exc:
@@ -746,127 +1148,22 @@ class JunieACPClient:
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_events: dict[str, dict[str, Any]] = {}
+        self._handler.begin_turn(session_id, text_parts, reasoning_parts, tool_events)
         # Mark dispatch so _run_prompt won't replay a prompt Junie may have
         # already acted on (see the retry guard).
         self._prompt_in_flight = True
-        self._request(
-            "session/prompt",
-            {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]},
-            timeout_seconds=timeout_seconds,
-            text_parts=text_parts,
-            reasoning_parts=reasoning_parts,
-            tool_events=tool_events,
-            drain_after=min(20.0, timeout_seconds),
-            session_id=session_id,
-        )
-        return "".join(text_parts), "".join(reasoning_parts), tool_events
-
-    def _handle_server_message(
-        self,
-        msg: dict[str, Any],
-        *,
-        process: subprocess.Popen[str],
-        cwd: str,
-        text_parts: list[str] | None,
-        reasoning_parts: list[str] | None,
-        tool_events: dict[str, dict[str, Any]] | None = None,
-        session_id: str | None = None,
-    ) -> bool:
-        method = msg.get("method")
-        if not isinstance(method, str):
-            return False
-
-        if method == "session/update":
-            params = msg.get("params") or {}
-            # One reused process serves many sessions over one shared inbox.
-            # Drop updates belonging to a *different* session (e.g. a straggler
-            # chunk from a previous turn), so a prior answer can't leak into this
-            # turn's text. When session_id is None (initialize/session/new phase)
-            # we don't filter.
-            if session_id is not None:
-                upd_sid = str(params.get("sessionId") or "").strip()
-                if upd_sid and upd_sid != session_id:
-                    return True
-            update = params.get("update") or {}
-            kind = str(update.get("sessionUpdate") or "").strip()
-            if kind in _TOOL_UPDATE_KINDS:
-                # Native structured tool activity (content is a list of blocks).
-                # Captured for observability, NOT turned into OpenAI tool_calls.
-                if tool_events is not None:
-                    _merge_tool_update(tool_events, update)
-                return True
-            # agent_message_chunk / agent_thought_chunk content may be a dict
-            # ({"type":"text","text":...}) or a list of such blocks.
-            chunk_text = _chunk_text(update.get("content"))
-            if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
-                text_parts.append(chunk_text)
-            elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
-                reasoning_parts.append(chunk_text)
-            return True
-
-        if process.stdin is None:
-            return True
-
-        message_id = msg.get("id")
-        params = msg.get("params") or {}
-
-        if method == "session/request_permission":
-            response = _permission_response(message_id, params, policy=self._permission_policy)
-        elif method == "fs/read_text_file":
-            try:
-                path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)
-                block_error = get_read_block_error(str(path))
-                if block_error:
-                    raise PermissionError(block_error)
-                try:
-                    content = path.read_text()
-                except FileNotFoundError:
-                    content = ""
-                line = params.get("line")
-                limit = params.get("limit")
-                has_line = isinstance(line, int) and line > 1
-                has_limit = isinstance(limit, int) and limit > 0
-                if has_line or has_limit:
-                    # Honor `limit` even when reading from the top (line 1/absent),
-                    # otherwise a paginated read returns the whole file.
-                    lines = content.splitlines(keepends=True)
-                    start = line - 1 if has_line else 0
-                    end = start + limit if has_limit else None
-                    content = "".join(lines[start:end])
-                if content:
-                    content = redact_sensitive_text(content, force=True)
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": message_id,
-                    "result": {
-                        "content": content,
-                    },
-                }
-            except Exception as exc:
-                response = _jsonrpc_error(message_id, -32602, str(exc))
-        elif method == "fs/write_text_file":
-            try:
-                path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)
-                if is_write_denied(str(path)):
-                    raise PermissionError(
-                        f"Write denied: '{path}' is a protected system/credential file."
-                    )
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(str(params.get("content") or ""))
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": message_id,
-                    "result": None,
-                }
-            except Exception as exc:
-                response = _jsonrpc_error(message_id, -32602, str(exc))
-        else:
-            response = _jsonrpc_error(
-                message_id,
-                -32601,
-                f"ACP client method '{method}' is not supported by Hermes yet.",
+        usage_obj: Any = None
+        try:
+            result = await self._conn.prompt(
+                prompt=[_acp.text_block(prompt_text)], session_id=session_id
             )
-
-        process.stdin.write(json.dumps(response) + "\n")
-        process.stdin.flush()
-        return True
+            usage_obj = getattr(result, "usage", None)
+            # The ACP completion response can precede a trailing message chunk;
+            # settle until Junie is quiet so we don't truncate the answer.
+            await self._handler.settle(self._settle_quiet_gap, min(self._settle_max, timeout_seconds))
+        finally:
+            self._handler.end_turn()
+        # A fresh session is opened per request (we re-send the full transcript),
+        # so we don't rely on Junie's cross-turn memory; sessions are left for
+        # the persistent process to reap, matching the original client.
+        return "".join(text_parts), "".join(reasoning_parts), tool_events, usage_obj

@@ -1,12 +1,14 @@
 """JetBrains Junie ACP provider profile.
 
 junie-acp uses an external ACP subprocess — NOT the standard transport.
-Hermes spawns ``junie --acp=true`` and speaks the Agent Client Protocol
-(JSON-RPC over stdio) to it, exactly like the ``copilot-acp`` provider does
-for GitHub Copilot. The profile captures auth + endpoint metadata; the actual
-subprocess driving lives in ``agent/junie_acp_client.py`` and the routing that
-selects it lives in ``agent/agent_runtime_helpers.py`` /
-``agent/auxiliary_client.py`` (``provider == "junie-acp"``).
+Hermes spawns ``junie --acp=true`` and speaks the Agent Client Protocol to it.
+Unlike the ``copilot-acp`` provider (which hand-rolls JSON-RPC over stdio), the
+Junie path drives the official Agent Client Protocol Python SDK
+(``agent-client-protocol``, the ``[acp]`` extra). The profile captures auth +
+endpoint metadata; the actual subprocess driving lives in
+``agent/junie_acp_client.py`` and the routing that selects it lives in
+``agent/agent_runtime_helpers.py`` / ``agent/auxiliary_client.py``
+(``provider == "junie-acp"``).
 
 This provider is intentionally independent of ``copilot-acp`` so upstream
 changes to the Copilot path cannot break the Junie integration.

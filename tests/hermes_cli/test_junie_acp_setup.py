@@ -32,15 +32,34 @@ def test_junie_aliases_resolve(alias):
     assert full is not None
 
 
-def test_junie_acp_curated_models_is_sentinel_only():
-    # Like copilot-acp: only the provider sentinel, so detect_provider_for_model
-    # doesn't mis-resolve real claude/gemini/gpt ids to junie-acp. A specific
-    # model is passed with -m and forwarded to Junie, not drawn from this list.
-    models = [m for m, _label in M.curated_models_for_provider("junie-acp")]
-    assert models == ["junie-acp"]
+def test_junie_acp_static_catalog_is_sentinel_only():
+    # The STATIC reverse-map must stay sentinel-only so detect_provider_for_model
+    # doesn't mis-resolve real claude/gemini/gpt ids to junie-acp (commit
+    # 09fb55ac6). Live discovery (below) is layered on top without touching it.
+    assert M._PROVIDER_MODELS["junie-acp"] == ["junie-acp"]
 
 
-def test_junie_acp_provider_model_ids():
+def test_junie_acp_falls_back_to_sentinel_when_discovery_unavailable(monkeypatch):
+    # No Junie CLI / not authed / offline -> fetch returns None -> sentinel only.
+    monkeypatch.setattr("agent.junie_acp_client.fetch_junie_models", lambda **_: None)
+    ids = M.provider_model_ids("junie-acp", force_refresh=True)
+    assert ids == ["junie-acp"]
+
+
+def test_junie_acp_live_models_are_merged_sentinel_first(monkeypatch):
+    # When Junie advertises models over ACP, the picker surfaces them — with the
+    # sentinel kept first — without duplicating it if Junie also returns it.
+    monkeypatch.setattr(
+        "agent.junie_acp_client.fetch_junie_models",
+        lambda **_: ["claude-fable-5", "claude-opus-4-8", "junie-acp"],
+    )
+    ids = M.provider_model_ids("junie-acp", force_refresh=True)
+    assert ids[0] == "junie-acp"
+    assert ids == ["junie-acp", "claude-fable-5", "claude-opus-4-8"]
+
+
+def test_junie_acp_provider_model_ids(monkeypatch):
+    monkeypatch.setattr("agent.junie_acp_client.fetch_junie_models", lambda **_: None)
     ids = M.provider_model_ids("junie-acp")
     assert "junie-acp" in ids
 

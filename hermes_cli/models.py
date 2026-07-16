@@ -2344,6 +2344,19 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         if normalized == "copilot-acp":
             return list(_PROVIDER_MODELS.get("copilot", []))
     if normalized == "junie-acp":
+        # Live catalog from the Junie ACP subprocess (session/new config_options).
+        # Cached + best-effort; NOT added to _PROVIDER_MODELS, so
+        # detect_provider_for_model() still reverse-maps claude/gemini/gpt ids to
+        # their real providers (see commit 09fb55ac6). Falls back to the sentinel.
+        try:
+            from agent.junie_acp_client import fetch_junie_models
+
+            live = fetch_junie_models(force_refresh=force_refresh)
+            if live:
+                sentinel = list(_PROVIDER_MODELS.get("junie-acp", []))
+                return sentinel + [m for m in live if m not in sentinel]
+        except Exception:
+            pass
         return list(_PROVIDER_MODELS.get("junie-acp", []))
     if normalized == "nous":
         # Try live Nous Portal /models endpoint
