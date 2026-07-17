@@ -80,7 +80,6 @@ class RealtimeSession:
         url = f"{REALTIME_URL}?model={self.model}"
         headers = [
             ("Authorization", f"Bearer {self.api_key}"),
-            ("OpenAI-Beta", "realtime=v1"),
         ]
         # websockets.sync.client.connect accepts either additional_headers=
         # (newer) or extra_headers= depending on version; try the newer
@@ -94,11 +93,15 @@ class RealtimeSession:
             {
                 "type": "session.update",
                 "session": {
+                    "type": "realtime",
+                    "model": self.model,
                     "voice": self.voice,
                     "instructions": self.instructions,
                     "modalities": ["audio", "text"],
-                    "output_audio_format": "pcm16",
-                    "input_audio_format": "pcm16",
+                    "audio": {
+                        "input": {"format": "pcm16"},
+                        "output": {"format": "pcm16"},
+                    },
                 },
             }
         )
@@ -166,7 +169,7 @@ class RealtimeSession:
                 if not isinstance(frame, dict):
                     continue
                 ftype = frame.get("type")
-                if ftype == "response.audio.delta":
+                if ftype in ("response.output_audio.delta", "response.audio.delta"):
                     b64 = frame.get("delta") or frame.get("audio") or ""
                     if b64 and sink_fp is not None:
                         try:
