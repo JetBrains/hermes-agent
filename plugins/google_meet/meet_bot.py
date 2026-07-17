@@ -553,12 +553,17 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 ),
                 "permissions": ["microphone", "camera"],
+                "locale": "en-US",
             }
             if auth_state and Path(auth_state).is_file():
                 context_args["storage_state"] = auth_state
             context = browser.new_context(**context_args)
             page = context.new_page()
 
+            # Force English UI on the Meet page, bypassing the account's cookie locale.
+            if "hl=" not in url:
+                sep = "&" if "?" in url else "?"
+                url = f"{url}{sep}hl=en"
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             except Exception as e:
