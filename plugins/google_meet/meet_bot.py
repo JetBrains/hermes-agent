@@ -833,6 +833,10 @@ def _click_join(page, state: _BotState) -> None:
     for label in ("Join now", "Ask to join"):
         try:
             btn = page.get_by_role("button", name=label, exact=False).first
+            try:
+                btn.wait_for(state="visible", timeout=20_000)
+            except Exception:
+                pass
             if btn.count() and btn.is_visible():
                 btn.click(timeout=3_000)
                 if label == "Ask to join":
