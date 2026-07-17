@@ -14,8 +14,10 @@ Tools:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Dict, Optional
 
+from hermes_constants import get_hermes_home
 from plugins.google_meet import process_manager as pm
 
 
@@ -268,11 +270,13 @@ def handle_meet_join(args: Dict[str, Any], **_kw) -> str:
             "`pip install playwright && python -m playwright install "
             "chromium`. Plugin is supported on Linux and macOS only."
         )
+    auth = Path(get_hermes_home()) / "workspace" / "meetings" / "auth.json"
     res = pm.start(
         url=url,
         headed=bool(args.get("headed", False)),
         guest_name=str(args.get("guest_name") or "Hermes Agent"),
         duration=str(args.get("duration")) if args.get("duration") else None,
+        auth_state=str(auth) if auth.is_file() else None,
         mode=mode,
     )
     return _json({"success": bool(res.get("ok")), **res})
