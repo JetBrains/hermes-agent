@@ -24,6 +24,33 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+# Avoid hot-looping corrupt-looking board DBs, but do not suppress
+# same-fingerprint retries forever: transient WAL/open races can surface as
+# "database disk image is malformed" for one tick.
+CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
+
+
+def _is_corrupt_board_db_error(exc: Exception) -> bool:
+    """True when *exc* means the board DB file itself is unusable.
+
+    Shared by the dispatcher (which quarantines the offending board) and the
+    notifier (which backs off its poll interval).
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        _kb = None
+    corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
+    if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return (
+        "file is not a database" in msg
+        or "database disk image is malformed" in msg
+    )
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -213,6 +240,10 @@ class GatewayKanbanWatchersMixin:
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
+
+        # Set while the board DB looks corrupt: stretches the poll interval to
+        # the quarantine window and keeps the error to one log line per outage.
+        corrupt_backoff = False
 
         while self._running:
             try:
@@ -650,9 +681,34 @@ class GatewayKanbanWatchersMixin:
                                 self._kanban_unsub, sub, board_slug,
                             )
             except Exception as exc:
-                logger.warning("kanban notifier tick failed: %s", exc)
+                if _is_corrupt_board_db_error(exc):
+                    # Same failure the dispatcher quarantines per board. The
+                    # notifier polls every `interval` seconds and a broken file
+                    # stays broken until someone moves it, so retrying at the
+                    # poll interval only fills the log — one observed instance
+                    # logged 2116 identical warnings in three hours. Back off to
+                    # the dispatcher's quarantine window instead.
+                    if not corrupt_backoff:
+                        logger.error(
+                            "kanban notifier: board database is not a valid SQLite "
+                            "database (%s); backing off to %ds between polls until "
+                            "the file is repaired or the gateway restarts. Move or "
+                            "restore the file, then run `hermes kanban init` if you "
+                            "need a fresh board.",
+                            exc,
+                            int(CORRUPT_BOARD_RETRY_AFTER_SECONDS),
+                        )
+                    corrupt_backoff = True
+                else:
+                    corrupt_backoff = False
+                    logger.warning("kanban notifier tick failed: %s", exc)
+            else:
+                corrupt_backoff = False
             # Sleep with cancellation checks.
-            for _ in range(int(max(1, interval))):
+            sleep_seconds = (
+                CORRUPT_BOARD_RETRY_AFTER_SECONDS if corrupt_backoff else interval
+            )
+            for _ in range(int(max(1, sleep_seconds))):
                 if not self._running:
                     return
                 await asyncio.sleep(1)
@@ -1024,10 +1080,6 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
-        # Avoid hot-looping corrupt-looking board DBs, but do not suppress
-        # same-fingerprint retries forever: transient WAL/open races can
-        # surface as "database disk image is malformed" for one tick.
-        CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
         disabled_corrupt_boards: dict[
             str, tuple[tuple[str, int | None, int | None], float]
         ] = {}
@@ -1043,18 +1095,6 @@ class GatewayKanbanWatchersMixin:
             except OSError:
                 return (resolved, None, None)
             return (resolved, stat.st_mtime_ns, stat.st_size)
-
-        def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
-            if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
-                return True
-            if not isinstance(exc, sqlite3.DatabaseError):
-                return False
-            msg = str(exc).lower()
-            return (
-                "file is not a database" in msg
-                or "database disk image is malformed" in msg
-            )
 
         def _tick_once_for_board(slug: str) -> "Optional[object]":
             """Run one dispatch_once for a specific board.

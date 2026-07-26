@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import sqlite3
 from pathlib import Path
 
 
@@ -292,6 +294,53 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     # The claim is rewound (adapter resolved to None → treated as disconnected),
     # so the event is still unseen and will deliver once beta's adapter connects.
     assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
+
+
+def test_kanban_notifier_backs_off_when_board_db_is_corrupt(tmp_path, monkeypatch, caplog):
+    """A corrupt board DB must not be retried at the poll interval.
+
+    The dispatcher already quarantines such a board. The notifier used to log
+    and retry every `interval` seconds for as long as the file stayed broken,
+    which fills the log with one identical line per tick and never recovers on
+    its own anyway.
+    """
+    db_path = tmp_path / "corrupt-kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _create_completed_subscription()
+
+    # Corruption that `connect()` does not catch: the file opens, then the
+    # first real query raises. A wholly unreadable file fails earlier, inside
+    # the per-board `connect()` guard, and is skipped at debug level — the
+    # production failure surfaces here, at tick level.
+    def _raise_malformed(*args, **kwargs):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(kb, "list_notify_subs", _raise_malformed)
+
+    runner = _make_runner(RecordingAdapter())
+
+    real_sleep = asyncio.sleep
+    seconds_slept = 0
+
+    async def fake_sleep(delay):
+        nonlocal seconds_slept
+        if delay == 5:  # startup delay
+            return None
+        seconds_slept += 1
+        # Ten 1-second steps: ten ticks at interval=1 without the backoff,
+        # still well inside a single quarantine window with it.
+        if seconds_slept >= 10:
+            runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("not a valid SQLite database" in m for m in messages) == 1
+    assert [m for m in messages if "kanban notifier tick failed" in m] == []
 
 
 def _unseen_terminal_events_for(tid, chat_id):
