@@ -17,6 +17,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
+from urllib.parse import urlsplit
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -301,7 +302,17 @@ def _resolve_slack_proxy_url() -> Optional[str]:
         )
         return None
 
-    if any(is_host_excluded_by_no_proxy(host) for host in _SLACK_PROXY_HOSTS):
+    proxy_hosts = _SLACK_PROXY_HOSTS
+    api_url = os.getenv("SLACK_API_URL", "").strip()
+    if api_url:
+        try:
+            api_host = urlsplit(api_url).hostname
+        except ValueError:
+            api_host = None
+        if api_host:
+            proxy_hosts = (*proxy_hosts, api_host)
+
+    if any(is_host_excluded_by_no_proxy(host) for host in proxy_hosts):
         logger.info("[Slack] NO_PROXY bypasses Slack proxy configuration")
         return None
 

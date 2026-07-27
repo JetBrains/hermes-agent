@@ -684,6 +684,47 @@ class TestSlackProxyBehavior:
         ):
             assert _slack_mod._resolve_slack_proxy_url() is None
 
+    def test_resolve_slack_proxy_url_checks_configured_api_host(self):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "SLACK_API_URL": "http://127.0.0.1:4100/api/",
+                    "NO_PROXY": "127.0.0.1,localhost",
+                },
+                clear=False,
+            ),
+            patch.object(
+                _slack_mod,
+                "resolve_proxy_url",
+                return_value="http://proxy.example.com:3128",
+            ),
+        ):
+            assert _slack_mod._resolve_slack_proxy_url() is None
+
+    def test_resolve_slack_proxy_url_preserves_proxy_when_api_host_is_not_excluded(
+        self,
+    ):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "SLACK_API_URL": "https://api.internal.example/api/",
+                    "NO_PROXY": "127.0.0.1,localhost",
+                },
+                clear=False,
+            ),
+            patch.object(
+                _slack_mod,
+                "resolve_proxy_url",
+                return_value="http://proxy.example.com:3128",
+            ),
+        ):
+            assert (
+                _slack_mod._resolve_slack_proxy_url()
+                == "http://proxy.example.com:3128"
+            )
+
     def test_resolve_slack_proxy_url_checks_all_slack_hosts(self):
         with (
             patch.object(
