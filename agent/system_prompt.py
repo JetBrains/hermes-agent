@@ -46,7 +46,7 @@ from agent.prompt_builder import (
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root
 from utils import is_truthy_value
 
 
@@ -393,8 +393,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         active_profile = _resolve_active_profile_name()
     except Exception:
         active_profile = "default"
-    hermes_home = str(get_hermes_home())
-    profiles_base = os.path.join(hermes_home, "profiles")
+    # ``get_default_hermes_root()`` resolves the ROOT hermes home (``~/.hermes``
+    # or the Docker/custom root) even under a named profile, where
+    # ``HERMES_HOME`` points at ``<root>/profiles/<name>``. Anchor the profiles
+    # base and the default profile's data paths at the root so a named-profile
+    # session never emits self-nested paths like
+    # ``<root>/profiles/<name>/profiles/<name>`` or a "default" data dir that
+    # actually points back inside the active profile.
+    hermes_root = str(get_default_hermes_root())
+    profiles_base = os.path.join(hermes_root, "profiles")
     if active_profile == "default":
         stable_parts.append(
             f"Active Hermes profile: default. Other profiles (if any) live "
@@ -408,9 +415,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         stable_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
             f"and writes {os.path.join(profiles_base, active_profile)}. The default "
-            f"profile's data lives at {os.path.join(hermes_home, 'skills')},"
-            f"{os.path.join(hermes_home, 'plugins')}, {os.path.join(hermes_home, 'cron')}, " 
-            f"{os.path.join(hermes_home, 'memories')} — those belong to a "
+            f"profile's data lives at {os.path.join(hermes_root, 'skills')}, "
+            f"{os.path.join(hermes_root, 'plugins')}, {os.path.join(hermes_root, 'cron')}, "
+            f"{os.path.join(hermes_root, 'memories')} — those belong to a "
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/cron/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "
