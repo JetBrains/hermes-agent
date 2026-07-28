@@ -468,8 +468,18 @@ def _handle_send(args):
     if platform_name == "slack" and chat_id and chat_id.startswith("U"):
         try:
             import aiohttp
+            # Honor a custom Slack Web API base URL (config.yaml slack.base_url →
+            # PlatformConfig.extra) so DM resolution hits the same endpoint as
+            # the rest of the Slack integration.
+            _slack_extra = getattr(pconfig, "extra", None) or {}
+            _slack_base = (
+                _slack_extra.get("base_url")
+                or "https://slack.com/api/"
+            ).strip()
+            if not _slack_base.endswith("/"):
+                _slack_base += "/"
             async def _open_slack_dm(token, user_id):
-                url = "https://slack.com/api/conversations.open"
+                url = _slack_base + "conversations.open"
                 headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                     async with session.post(url, headers=headers, json={"users": [user_id]}) as resp:
