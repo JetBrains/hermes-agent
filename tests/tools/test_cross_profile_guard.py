@@ -242,17 +242,59 @@ class TestSystemPromptActiveProfile:
         # See agent/system_prompt.py for the exact wording.
 
     def test_named_profile_line_in_prompt_text(self, fake_hermes):
-        """When active profile is 'hermes-security', the prompt warns
-        explicitly about NOT modifying default's skills/plugins/cron/memories."""
-        # Spot-check by reading the source — the contract is:
-        # (1) names the active profile, (2) names the default-profile
-        # paths, (3) says "do not modify another profile's" without
-        # explicit user direction.
-        from pathlib import Path
-        src = Path("agent/system_prompt.py").read_text()
-        assert "Active Hermes profile" in src
-        assert "cross_profile=True" in src
-        assert "~/.hermes/profiles/" in src
-        # Both branches present (default and named profile).
-        assert "Active Hermes profile: default" in src
-        assert "Active Hermes profile: {active_profile}" in src
+        """When active profile is 'hermes-security', the *built* system prompt
+        must (1) name the active profile, (2) point reads/writes at the active
+        profile's own dir, (3) anchor the default profile's data at the ROOT
+        (not nested inside the active profile), and (4) warn against modifying
+        another profile without cross_profile=True.
+
+        Asserts the rendered prompt, not the source text: reading the source
+        would freeze wording/formatting instead of behavior (a banned
+        antipattern) and — as the get_hermes_home vs get_default_hermes_root
+        regression showed — would miss a real profile-path bug entirely.
+        """
+        import os
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from agent.system_prompt import build_system_prompt_parts
+
+        agent = SimpleNamespace(
+            load_soul_identity=False,
+            skip_context_files=False,
+            valid_tool_names=[],
+            _task_completion_guidance=False,
+            _tool_use_enforcement=False,
+            _environment_probe=False,
+            _kanban_worker_guidance="",
+            _memory_store=None,
+            _memory_manager=None,
+            model="",
+            provider="",
+            platform="",
+            pass_session_id=False,
+            session_id="",
+        )
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+        ):
+            stable = build_system_prompt_parts(agent)["stable"]
+
+        root = str(fake_hermes["root"])
+        active_home = str(fake_hermes["sec_home"])  # <root>/profiles/hermes-security
+
+        # (1) names the active profile.
+        assert "Active Hermes profile: hermes-security" in stable
+        # (2) reads/writes point at the active profile's own dir.
+        assert active_home in stable
+        # (3) the default profile's data is anchored at the ROOT — NOT nested
+        #     under the active profile (the get_default_hermes_root fix; the
+        #     old get_hermes_home code emitted <active_home>/skills here).
+        assert os.path.join(root, "skills") in stable
+        assert os.path.join(active_home, "skills") not in stable
+        # (4) cross-profile guidance + explicit override flag.
+        assert "cross_profile=True" in stable
+        assert "another profile's skills/plugins/cron/memories" in stable
