@@ -889,6 +889,282 @@ class TestSlackProxyBehavior:
 
 
 # ---------------------------------------------------------------------------
+# TestSlackBaseUrl
+# ---------------------------------------------------------------------------
+
+
+class TestSlackBaseUrl:
+    """Custom Slack Web API base URL + its NO_PROXY interaction."""
+
+    def test_normalize_slack_base_url(self):
+        assert _slack_mod._normalize_slack_base_url(None) is None
+        assert _slack_mod._normalize_slack_base_url("") is None
+        assert _slack_mod._normalize_slack_base_url("   ") is None
+        # Trailing slash is enforced (slack_sdk urljoin needs it).
+        assert (
+            _slack_mod._normalize_slack_base_url("https://slack.internal.corp/api")
+            == "https://slack.internal.corp/api/"
+        )
+        assert (
+            _slack_mod._normalize_slack_base_url("https://slack.internal.corp/api/")
+            == "https://slack.internal.corp/api/"
+        )
+        assert _slack_mod._normalize_slack_base_url("  https://x/api  ") == "https://x/api/"
+
+    def test_slack_base_url_host(self):
+        assert _slack_mod._slack_base_url_host(None) is None
+        assert _slack_mod._slack_base_url_host("") is None
+        assert (
+            _slack_mod._slack_base_url_host("https://slack.internal.corp/api/")
+            == "slack.internal.corp"
+        )
+        # Host is lowercased and the port is dropped.
+        assert (
+            _slack_mod._slack_base_url_host("https://SLACK.INTERNAL.CORP:8443/api/")
+            == "slack.internal.corp"
+        )
+
+    def test_slack_proxy_bypass_hosts_appends_custom_host(self):
+        assert _slack_mod._slack_proxy_bypass_hosts() == _slack_mod._SLACK_PROXY_HOSTS
+        assert _slack_mod._slack_proxy_bypass_hosts(None) == _slack_mod._SLACK_PROXY_HOSTS
+        hosts = _slack_mod._slack_proxy_bypass_hosts("https://slack.internal.corp/api/")
+        assert "slack.internal.corp" in hosts
+        assert set(_slack_mod._SLACK_PROXY_HOSTS).issubset(set(hosts))
+        # A base_url that resolves to a built-in host is not duplicated.
+        assert (
+            _slack_mod._slack_proxy_bypass_hosts("https://slack.com/api/")
+            == _slack_mod._SLACK_PROXY_HOSTS
+        )
+
+    def test_apply_slack_base_url_sets_client_base_url(self):
+        class _Client:
+            base_url = "https://slack.com/api/"
+
+        client = _Client()
+        _slack_mod._apply_slack_base_url(client, "https://slack.internal.corp/api/")
+        assert client.base_url == "https://slack.internal.corp/api/"
+        # None leaves the current base_url untouched (never clears it).
+        _slack_mod._apply_slack_base_url(client, None)
+        assert client.base_url == "https://slack.internal.corp/api/"
+
+    def test_resolve_slack_proxy_url_bypasses_custom_base_url_host(self):
+        with (
+            patch.object(
+                _slack_mod,
+                "resolve_proxy_url",
+                return_value="http://proxy.example.com:3128",
+            ),
+            patch.object(
+                _slack_mod,
+                "is_host_excluded_by_no_proxy",
+                side_effect=lambda host: host == "slack.internal.corp",
+            ) as excluded,
+        ):
+            assert (
+                _slack_mod._resolve_slack_proxy_url("https://slack.internal.corp/api/")
+                is None
+            )
+            excluded.assert_any_call("slack.internal.corp")
+
+    def test_resolve_slack_proxy_url_keeps_proxy_when_custom_host_not_bypassed(self):
+        with (
+            patch.object(
+                _slack_mod,
+                "resolve_proxy_url",
+                return_value="http://proxy.example.com:3128",
+            ),
+            patch.object(
+                _slack_mod, "is_host_excluded_by_no_proxy", return_value=False
+            ),
+        ):
+            assert (
+                _slack_mod._resolve_slack_proxy_url("https://slack.internal.corp/api/")
+                == "http://proxy.example.com:3128"
+            )
+
+    def test_resolve_slack_base_url_reads_from_extra(self):
+        # Read from PlatformConfig.extra (config.yaml -> extra), normalized.
+        cfg = PlatformConfig(
+            enabled=True,
+            token="xoxb-x",
+            extra={"base_url": "https://from-extra/api"},
+        )
+        adapter = SlackAdapter(cfg)
+        assert adapter._resolve_slack_base_url() == "https://from-extra/api/"
+
+        # No base_url in extra -> None (slack_sdk default); a stray
+        # SLACK_BASE_URL env var is ignored.
+        adapter2 = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-x", extra={}))
+        assert adapter2._resolve_slack_base_url() is None
+        with patch.dict(os.environ, {"SLACK_BASE_URL": "https://from-env/api"}, clear=False):
+            assert adapter2._resolve_slack_base_url() is None
+
+    def test_apply_yaml_config_seeds_base_url_into_extra(self):
+        # base_url is returned as an extra (merged into PlatformConfig.extra by
+        # the loader), not set as an env var.
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop("SLACK_BASE_URL", None)
+            result = _slack_mod._apply_yaml_config(
+                {"slack": {"base_url": "https://slack.internal.corp/api"}},
+                {"base_url": "https://slack.internal.corp/api"},
+            )
+            assert result == {"base_url": "https://slack.internal.corp/api"}
+            # The hook sets no env var.
+            assert os.environ.get("SLACK_BASE_URL") is None
+
+    def test_apply_yaml_config_without_base_url_returns_none(self):
+        # No base_url key -> nothing seeded (None); a blank value is unset too.
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop("SLACK_BASE_URL", None)
+            assert _slack_mod._apply_yaml_config({"slack": {}}, {}) is None
+            assert (
+                _slack_mod._apply_yaml_config(
+                    {"slack": {"base_url": "   "}}, {"base_url": "   "}
+                )
+                is None
+            )
+            assert os.environ.get("SLACK_BASE_URL") is None
+
+    @pytest.mark.asyncio
+    async def test_connect_applies_custom_base_url_to_clients(self):
+        created_apps = []
+        created_clients = []
+
+        class FakeWebClient:
+            def __init__(self, token):
+                self.token = token
+                self.proxy = None
+                self.base_url = "https://slack.com/api/"
+                suffix = token.split("-")[-1]
+                self.auth_test = AsyncMock(
+                    return_value={
+                        "team_id": f"T_{suffix}",
+                        "user_id": f"U_{suffix}",
+                        "user": f"bot-{suffix}",
+                        "team": f"Team {suffix}",
+                    }
+                )
+                created_clients.append(self)
+
+        class FakeApp:
+            def __init__(self, token):
+                self.token = token
+                self.client = FakeWebClient(token)
+                created_apps.append(self)
+
+            def event(self, event_type):
+                def decorator(fn):
+                    return fn
+
+                return decorator
+
+            def command(self, command_name):
+                def decorator(fn):
+                    return fn
+
+                return decorator
+
+            def action(self, action_id):
+                def decorator(fn):
+                    return fn
+
+                return decorator
+
+        class FakeSocketModeHandler:
+            def __init__(self, app, app_token, proxy=None):
+                self.app = app
+                self.app_token = app_token
+                self.proxy = proxy
+                self.client = MagicMock()
+
+            async def start_async(self):
+                return None
+
+            async def close_async(self):
+                return None
+
+        # base_url without a trailing slash → normalized end-to-end.
+        config = PlatformConfig(
+            enabled=True,
+            token="xoxb-primary,xoxb-secondary",
+            extra={"base_url": "https://slack.internal.corp/api"},
+        )
+        adapter = SlackAdapter(config)
+
+        with (
+            patch.object(_slack_mod, "AsyncApp", side_effect=FakeApp),
+            patch.object(_slack_mod, "AsyncWebClient", side_effect=FakeWebClient),
+            patch.object(_slack_mod, "AsyncSocketModeHandler", FakeSocketModeHandler),
+            patch.object(_slack_mod, "_resolve_slack_proxy_url", return_value=None),
+            patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}, clear=False),
+            patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
+            patch("asyncio.create_task", side_effect=_fake_create_task),
+        ):
+            result = await adapter.connect()
+
+        assert result is True
+        assert created_apps[0].client.base_url == "https://slack.internal.corp/api/"
+        assert all(
+            client.base_url == "https://slack.internal.corp/api/"
+            for client in created_clients
+        )
+        assert adapter._base_url == "https://slack.internal.corp/api/"
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_uses_custom_base_url(self, monkeypatch):
+        from types import SimpleNamespace
+
+        class _Resp:
+            status = 200
+
+            async def json(self):
+                return {"ok": True, "ts": "1699999999.000100"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return None
+
+        class _Session:
+            def __init__(self):
+                self.calls = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return None
+
+            def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return _Resp()
+
+        session = _Session()
+        fake_aiohttp = SimpleNamespace(
+            ClientSession=lambda timeout=None, **kw: session,
+            ClientTimeout=lambda total=None: None,
+        )
+        monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+        # No proxy so the request kwargs stay empty and deterministic.
+        monkeypatch.setattr(
+            "gateway.platforms.base.resolve_proxy_url", lambda *a, **kw: None
+        )
+
+        cfg = PlatformConfig(
+            enabled=True,
+            token="xoxb-tok",
+            extra={"base_url": "https://slack.internal.corp/api"},
+        )
+        result = await _slack_mod._standalone_send(cfg, "C123", "hello cron")
+
+        assert result.get("success") is True
+        assert len(session.calls) == 1
+        url, _kwargs = session.calls[0]
+        assert url == "https://slack.internal.corp/api/chat.postMessage"
+
+
+# ---------------------------------------------------------------------------
 # TestSendDocument
 # ---------------------------------------------------------------------------
 

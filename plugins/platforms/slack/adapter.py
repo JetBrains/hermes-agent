@@ -17,6 +17,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
+from urllib.parse import urlsplit
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -280,6 +281,54 @@ def _apply_slack_proxy(client: Any, proxy_url: Optional[str]) -> None:
         client.proxy = proxy_url
 
 
+# Default Slack Web API base URL used by ``slack_sdk`` (AsyncWebClient.BASE_URL).
+_DEFAULT_SLACK_BASE_URL = "https://slack.com/api/"
+
+
+def _normalize_slack_base_url(raw: Optional[str]) -> Optional[str]:
+    """Normalize a custom Slack Web API base URL.
+
+    Returns ``None`` when unset/blank so callers fall back to the slack_sdk
+    default (``https://slack.com/api/``). A trailing slash is enforced because
+    ``slack_sdk`` joins ``base_url`` with the API method via ``urljoin`` — a
+    missing slash would drop the final path segment (``.../api`` +
+    ``chat.postMessage`` -> ``.../chat.postMessage``).
+    """
+    if not raw:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    if not value.endswith("/"):
+        value += "/"
+    return value
+
+
+def _slack_base_url_host(base_url: Optional[str]) -> Optional[str]:
+    """Extract the lowercase hostname from a Slack base URL for NO_PROXY checks."""
+    if not base_url:
+        return None
+    try:
+        host = urlsplit(str(base_url)).hostname
+    except Exception:
+        return None
+    if not host:
+        return None
+    return host.strip().lower() or None
+
+
+def _apply_slack_base_url(client: Any, base_url: Optional[str]) -> None:
+    """Point a Slack SDK client at a custom Web API base URL when configured.
+
+    Set post-construction (like ``_apply_slack_proxy``) because ``slack_sdk``
+    reads ``client.base_url`` at call time in ``api_call()`` — so overriding it
+    after the client is built is respected on every request. A ``None``/blank
+    ``base_url`` leaves the slack_sdk default untouched.
+    """
+    if base_url and hasattr(client, "base_url"):
+        client.base_url = base_url
+
+
 _SLACK_PROXY_HOSTS = (
     "slack.com",
     "files.slack.com",
@@ -287,8 +336,26 @@ _SLACK_PROXY_HOSTS = (
 )
 
 
-def _resolve_slack_proxy_url() -> Optional[str]:
-    """Resolve a proxy URL that Slack SDK clients can safely use."""
+def _slack_proxy_bypass_hosts(base_url: Optional[str] = None) -> Tuple[str, ...]:
+    """Return the hosts checked against NO_PROXY for Slack.
+
+    Always includes the built-in Slack hosts; when a custom ``base_url`` is
+    configured its host is appended so ``NO_PROXY=<custom-host>`` disables the
+    proxy for a self-hosted / mock Slack endpoint too (the built-in list alone
+    only covers the real ``slack.com`` hosts).
+    """
+    custom_host = _slack_base_url_host(base_url)
+    if custom_host and custom_host not in _SLACK_PROXY_HOSTS:
+        return _SLACK_PROXY_HOSTS + (custom_host,)
+    return _SLACK_PROXY_HOSTS
+
+
+def _resolve_slack_proxy_url(base_url: Optional[str] = None) -> Optional[str]:
+    """Resolve a proxy URL that Slack SDK clients can safely use.
+
+    When ``base_url`` points at a custom Slack endpoint, its host participates
+    in the NO_PROXY bypass check alongside the built-in Slack hosts.
+    """
     proxy_url = resolve_proxy_url()
     if not proxy_url:
         return None
@@ -301,7 +368,10 @@ def _resolve_slack_proxy_url() -> Optional[str]:
         )
         return None
 
-    if any(is_host_excluded_by_no_proxy(host) for host in _SLACK_PROXY_HOSTS):
+    if any(
+        is_host_excluded_by_no_proxy(host)
+        for host in _slack_proxy_bypass_hosts(base_url)
+    ):
         logger.info("[Slack] NO_PROXY bypasses Slack proxy configuration")
         return None
 
@@ -483,6 +553,7 @@ class SlackAdapter(BasePlatformAdapter):
         # self-heal when Slack silently drops the websocket.
         self._app_token: Optional[str] = None
         self._proxy_url: Optional[str] = None
+        self._base_url: Optional[str] = None
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
@@ -951,6 +1022,18 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:  # pragma: no cover - diagnostics must never break connect
             pass
 
+    def _resolve_slack_base_url(self) -> Optional[str]:
+        """Return the custom Slack Web API base URL, or ``None`` for the default.
+
+        Read from ``PlatformConfig.extra['base_url']`` (populated from
+        ``config.yaml``). ``None`` keeps the slack_sdk default
+        (``https://slack.com/api/``).
+        """
+        raw = None
+        if self.config.extra:
+            raw = self.config.extra.get("base_url")
+        return _normalize_slack_base_url(raw)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Slack via Socket Mode."""
         if not SLACK_AVAILABLE:
@@ -969,7 +1052,14 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] SLACK_APP_TOKEN not set")
             return False
 
-        proxy_url = _resolve_slack_proxy_url()
+        base_url = self._resolve_slack_base_url()
+        if base_url:
+            logger.info(
+                "[Slack] Using custom Slack API base URL: %s",
+                safe_url_for_log(base_url),
+            )
+
+        proxy_url = _resolve_slack_proxy_url(base_url)
         if proxy_url:
             logger.info(
                 "[Slack] Using proxy for Slack transport: %s",
@@ -1039,6 +1129,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._app = None
             self._app_token = app_token
             self._proxy_url = proxy_url
+            self._base_url = base_url
 
             # Reset multi-workspace state before re-populating it so a
             # reconnect that drops a workspace (or rotates the primary bot
@@ -1052,11 +1143,13 @@ class SlackAdapter(BasePlatformAdapter):
             primary_token = bot_tokens[0]
             self._app = AsyncApp(token=primary_token)
             _apply_slack_proxy(self._app.client, proxy_url)
+            _apply_slack_base_url(self._app.client, base_url)
 
             # Register each bot token and map team_id → client
             for token in bot_tokens:
                 client = AsyncWebClient(token=token)
                 _apply_slack_proxy(client, proxy_url)
+                _apply_slack_base_url(client, base_url)
                 auth_response = await client.auth_test()
                 team_id = auth_response.get("team_id", "")
                 bot_user_id = auth_response.get("user_id", "")
@@ -4341,9 +4434,14 @@ async def _standalone_send(
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
 
-        _proxy = resolve_proxy_url()
+        _extra = getattr(pconfig, "extra", None) or {}
+        # base_url from PlatformConfig.extra (config.yaml), matching the
+        # in-process adapter.
+        _base_url = _normalize_slack_base_url(_extra.get("base_url"))
+        # NO_PROXY-aware for the built-in Slack hosts and any custom base_url host.
+        _proxy = resolve_proxy_url(target_hosts=_slack_proxy_bypass_hosts(_base_url))
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-        url = "https://slack.com/api/chat.postMessage"
+        url = (_base_url or _DEFAULT_SLACK_BASE_URL) + "chat.postMessage"
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -4493,14 +4591,17 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     legacy ``slack_cfg`` block that used to live in
     ``gateway/config.py::load_gateway_config()`` before this migration.
 
-    The SlackAdapter reads its runtime configuration via ``os.getenv()``
-    throughout the connect / handle code paths, so rather than rewrite those
-    call sites to read from ``PlatformConfig.extra``, this hook keeps the
-    existing env-driven model and owns the YAML→env translation here, next to
-    the adapter that consumes it. Env vars take precedence over YAML — every
-    assignment is guarded by ``not os.getenv(...)`` so explicit env vars
-    survive a config.yaml update. Returns ``None`` because no extras are
-    seeded into ``PlatformConfig.extra`` directly (everything flows through env).
+    The SlackAdapter reads most of its runtime configuration via
+    ``os.getenv()`` throughout the connect / handle code paths, so rather than
+    rewrite those call sites to read from ``PlatformConfig.extra``, this hook
+    keeps the existing env-driven model and owns the YAML→env translation here,
+    next to the adapter that consumes it. Env vars take precedence over YAML —
+    every assignment is guarded by ``not os.getenv(...)`` so explicit env vars
+    survive a config.yaml update.
+
+    ``base_url`` is the exception: instead of an env var it is returned in the
+    extras dict, which the loader merges into ``PlatformConfig.extra`` for the
+    adapter to read.
     """
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
@@ -4520,7 +4621,16 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
-    return None  # all settings flow through env; nothing to merge into extras
+    # base_url (custom / self-hosted Slack endpoint) is behavioral config, so it
+    # lives in config.yaml, not .env. Return it in extras (merged into
+    # PlatformConfig.extra) — the adapter reads it from there, not an env var.
+    extras: dict = {}
+    bu = slack_cfg.get("base_url")
+    if bu is not None:
+        bu = str(bu).strip()
+        if bu:
+            extras["base_url"] = bu
+    return extras or None
 
 
 def _is_connected(config) -> bool:
@@ -4556,9 +4666,10 @@ def register(ctx) -> None:
         setup_fn=interactive_setup,
         # YAML→env config bridge — owns the translation of config.yaml slack:
         # keys (require_mention, strict_mention, allow_bots,
-        # free_response_channels, reactions, allowed_channels) into SLACK_*
-        # env vars that the adapter reads via os.getenv(). Replaces the
-        # hardcoded block in gateway/config.py. Hook contract: #24849.
+        # free_response_channels, reactions, allowed_channels) into SLACK_* env
+        # vars that the adapter reads via os.getenv(). The one non-env key,
+        # base_url, is returned in extras and merged into PlatformConfig.extra.
+        # Replaces the hardcoded block in gateway/config.py. Hook contract: #24849.
         apply_yaml_config_fn=_apply_yaml_config,
         # Auth env vars for _is_user_authorized() integration
         allowed_users_env="SLACK_ALLOWED_USERS",

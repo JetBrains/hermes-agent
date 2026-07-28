@@ -33,6 +33,7 @@ from tools.send_message_tool import (
     _send_signal,
     _send_telegram,
     _send_to_platform,
+    _slack_dm_base_url,
     send_message_tool,
 )
 # Discord helpers moved to the plugin in #24325.  Import from the new path
@@ -274,6 +275,49 @@ def _ensure_slack_mock(monkeypatch):
         ("slack_sdk.web.async_client", slack_sdk.web.async_client),
     ]:
         monkeypatch.setitem(sys.modules, name, mod)
+
+
+class TestSlackDmBaseUrl:
+    """_slack_dm_base_url falls back to the slack_sdk default for unset/blank
+    values and always yields a trailing slash, so the conversations.open URL is
+    never malformed (the reviewer-flagged '/conversations.open' collapse)."""
+
+    def test_unset_falls_back_to_default(self):
+        assert _slack_dm_base_url(None) == "https://slack.com/api/"
+        assert _slack_dm_base_url({}) == "https://slack.com/api/"
+
+    def test_empty_string_falls_back_to_default(self):
+        assert _slack_dm_base_url({"base_url": ""}) == "https://slack.com/api/"
+
+    def test_whitespace_falls_back_to_default(self):
+        # Reachable verbatim via platforms.slack.extra.base_url; must not
+        # collapse to "/".
+        assert _slack_dm_base_url({"base_url": "   "}) == "https://slack.com/api/"
+
+    def test_custom_host_gets_trailing_slash(self):
+        assert (
+            _slack_dm_base_url({"base_url": "https://slack.internal.corp/api"})
+            == "https://slack.internal.corp/api/"
+        )
+
+    def test_custom_host_trailing_slash_preserved(self):
+        assert (
+            _slack_dm_base_url({"base_url": "https://slack.internal.corp/api/"})
+            == "https://slack.internal.corp/api/"
+        )
+
+    def test_surrounding_whitespace_is_stripped(self):
+        assert (
+            _slack_dm_base_url({"base_url": "  https://slack.internal.corp/api  "})
+            == "https://slack.internal.corp/api/"
+        )
+
+    def test_conversations_open_url_never_collapses_to_root(self):
+        # The exact string the DM path builds must always be well-formed.
+        for extra in (None, {}, {"base_url": ""}, {"base_url": "   "}):
+            url = _slack_dm_base_url(extra) + "conversations.open"
+            assert url == "https://slack.com/api/conversations.open"
+            assert not url.startswith("/conversations.open")
 
 
 class TestSendMessageTool:

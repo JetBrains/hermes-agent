@@ -351,6 +351,21 @@ def _handle_react(args, remove=False):
     return json.dumps({"success": bool(result)})
 
 
+def _slack_dm_base_url(extra: dict | None) -> str:
+    """Resolve the Slack Web API base URL for DM resolution (conversations.open).
+
+    Falls back to the slack_sdk default (``https://slack.com/api/``) when the
+    configured value is unset or blank, so a whitespace-only ``base_url``
+    (reachable verbatim via ``platforms.slack.extra.base_url``) never collapses
+    to ``"/"``. A trailing slash is enforced.
+    """
+    raw = (extra or {}).get("base_url")
+    base = (str(raw).strip() if raw else "") or "https://slack.com/api/"
+    if not base.endswith("/"):
+        base += "/"
+    return base
+
+
 def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
@@ -468,8 +483,12 @@ def _handle_send(args):
     if platform_name == "slack" and chat_id and chat_id.startswith("U"):
         try:
             import aiohttp
+            # Honor a custom Slack Web API base URL (config.yaml →
+            # PlatformConfig.extra) so DM resolution hits the same endpoint as
+            # the rest of the Slack integration.
+            _slack_base = _slack_dm_base_url(getattr(pconfig, "extra", None))
             async def _open_slack_dm(token, user_id):
-                url = "https://slack.com/api/conversations.open"
+                url = _slack_base + "conversations.open"
                 headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                     async with session.post(url, headers=headers, json={"users": [user_id]}) as resp:

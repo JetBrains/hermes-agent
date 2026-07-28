@@ -369,6 +369,45 @@ platforms:
 | `platforms.slack.extra.rich_blocks` | `false` | When `true`, agent messages are rendered as [Block Kit](https://docs.slack.dev/block-kit/) blocks (headers, dividers, true nested lists, and native tables). A plain-text fallback is always sent. Tables over Slack's limits fall back to aligned monospace. No app reinstall required — it's a send-side change only. |
 | `platforms.slack.extra.cron_continuable_surface` | `"thread"` | Delivery surface for [continuable cron jobs](../features/cron.md#flat-in-channel-continuation-slack). `"thread"` opens a dedicated thread per delivery (default); `"in_channel"` delivers flat into the channel timeline. Pair `in_channel` with `reply_in_thread: false` (and `require_mention: false`) so a plain channel reply continues the job. |
 
+### Custom API endpoint (`base_url`) & network proxy
+
+By default Hermes talks to Slack's Web API at `https://slack.com/api/`. If you run
+a **self-hosted Slack-compatible server**, a **staging/mock endpoint**, or a
+dedicated Enterprise endpoint, point Hermes at it with `base_url`:
+
+```yaml
+slack:
+  # Custom Slack Web API base URL (default: https://slack.com/api/).
+  # A trailing slash is added automatically if you omit it. Set it here in
+  # config.yaml, not .env (which holds secrets like SLACK_BOT_TOKEN).
+  base_url: "https://slack.internal.corp/api/"
+```
+
+`base_url` applies to every Web API call (`chat.postMessage`, `auth.test`, file
+uploads, …), including out-of-process cron delivery. Socket Mode obtains its
+WebSocket URL dynamically from the endpoint's `apps.connections.open`, so a fully
+custom endpoint must implement that method too.
+
+#### Routing Slack through a proxy
+
+Hermes honors the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` environment
+variables (and, on macOS, the system proxy) for Slack traffic. Only `http://` and
+`https://` proxy schemes are used for the in-process Slack bot; other schemes
+(e.g. SOCKS) are ignored for it.
+
+To send Slack **directly**, bypassing the proxy, add a Slack host to `NO_PROXY`:
+
+```bash
+# Bypass the proxy for the real Slack hosts
+NO_PROXY=slack.com
+```
+
+`NO_PROXY=slack.com` covers `slack.com`, `files.slack.com`, and
+`wss-primary.slack.com`. When you set a custom `base_url`, **its host is honored in
+`NO_PROXY` too** — so `NO_PROXY=slack.internal.corp` disables the proxy for your
+custom endpoint. As soon as a matching host appears in `NO_PROXY`, Slack traffic
+goes direct.
+
 ### Session Isolation
 
 ```yaml
