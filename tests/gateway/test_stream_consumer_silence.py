@@ -9,12 +9,15 @@ raw marker onto the screen delta-by-delta and finalized it *before* the
 whole-response filter could run.  On any streaming-capable adapter (Slack,
 Telegram, Discord, …) users saw a literal ``NO_REPLY`` bubble.
 
-These tests pin the two halves of the fix:
+These tests pin the fix:
 
 * ``is_partial_silence_marker`` — the mid-stream hold-back predicate.
 * ``GatewayStreamConsumer`` — an exact-marker final buffer is suppressed and
   any already-shown preview is retracted, while substantive prose that merely
   mentions a marker is delivered normally.
+* ``GatewayStreamConsumer`` — a bare marker emitted as a preamble before a
+  tool call in the same turn is suppressed without ending the stream, so the
+  post-tool answer still delivers.
 """
 
 from __future__ import annotations
@@ -236,4 +239,98 @@ class TestStreamedSilenceSuppression:
 
         delivered = "".join(_sent_and_edited(adapter))
         assert "the build is already green" in delivered
+        assert consumer.final_content_delivered is True
+
+
+class TestStreamedSilencePreambleSuppression:
+    """A bare marker preamble followed by a tool call in the same turn.
+
+    The marker arrives as a completed segment (a tool/segment boundary) rather
+    than at stream end, so it is suppressed there too while the post-tool
+    answer still delivers.
+    """
+
+    @pytest.mark.asyncio
+    async def test_marker_preamble_before_tool_is_suppressed_answer_delivered(self):
+        """A [SILENT] preamble before a tool call is dropped; the post-tool answer is delivered."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta("[SILENT]")
+        consumer.on_segment_break()          # tool call in the same turn
+        consumer.on_delta("Deployed successfully — the build is green.")
+        consumer.finish()
+        await consumer.run()
+
+        delivered = "".join(_sent_and_edited(adapter))
+        assert "[SILENT]" not in delivered, f"marker leaked: {delivered!r}"
+        assert "the build is green" in delivered
+        assert consumer.final_content_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_no_reply_preamble_before_tool_without_followup_is_silent(self):
+        """A NO_REPLY preamble + tool call + no answer stays fully silent."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta("NO_REPLY")
+        consumer.on_segment_break()          # tool call, then the turn ends
+        consumer.finish()
+        await consumer.run()
+
+        for text in _sent_and_edited(adapter):
+            assert "NO_REPLY" not in text, f"marker leaked: {text!r}"
+        adapter.send.assert_not_awaited()
+        assert consumer.final_response_sent is False
+        assert consumer.final_content_delivered is False
+        assert consumer.already_sent is False
+
+    @pytest.mark.asyncio
+    async def test_marker_preamble_preview_is_retracted_on_segment_break(self):
+        """A marker shown as a preview is deleted when the tool boundary lands."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        # Pretend "[SILENT]" was already shown as a preview before the segment
+        # break runs.
+        consumer._message_id = "preview_1"
+        consumer._preview_message_ids = {"preview_1"}
+        consumer._already_sent = True
+
+        consumer.on_delta("[SILENT]")
+        consumer.on_segment_break()
+        consumer.on_delta("All done.")
+        consumer.finish()
+        await consumer.run()
+
+        # The stale marker preview was best-effort deleted.
+        adapter.delete_message.assert_any_await("chat_1", "preview_1")
+        delivered = "".join(_sent_and_edited(adapter))
+        assert "[SILENT]" not in delivered
+        assert "All done." in delivered
+        assert consumer.final_content_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_prose_preamble_before_tool_is_delivered(self):
+        """A substantive (non-marker) preamble before a tool call is delivered, not dropped."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+        )
+        consumer.on_delta("Let me check the deployment status.")
+        consumer.on_segment_break()
+        consumer.on_delta("It is green.")
+        consumer.finish()
+        await consumer.run()
+
+        delivered = "".join(_sent_and_edited(adapter))
+        assert "Let me check the deployment status." in delivered
+        assert "It is green." in delivered
         assert consumer.final_content_delivered is True

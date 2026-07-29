@@ -619,6 +619,19 @@ class GatewayStreamConsumer:
                         await self._suppress_silence_marker()
                         return
 
+                # Same suppression on a tool/segment boundary: a bare marker
+                # emitted as a preamble before a tool call in the same turn
+                # arrives as a completed segment, which the got_done branch
+                # never sees.  Drop the marker and reset the segment, but keep
+                # the stream going so the post-tool answer still delivers.
+                if got_segment_break and _is_intentional_silence_response(
+                    self._clean_for_display(self._accumulated)
+                ):
+                    await self._suppress_silence_marker()
+                    self._reset_segment_state(preserve_no_edit=True)
+                    await asyncio.sleep(0.05)  # Small yield to not busy-loop
+                    continue
+
                 # Decide whether to flush an edit
                 now = time.monotonic()
                 elapsed = now - self._last_edit_time
