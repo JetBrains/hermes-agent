@@ -8185,6 +8185,35 @@ def _newest_pr_comment(
     return newest
 
 
+def _has_run_history(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when this task has ever been picked up for work.
+
+    Two independent markers, because either one alone has a blind spot:
+
+    1. A ``task_runs`` row — written by every claim path (dispatcher spawn,
+       ``claim_task``, an external lane claiming directly), so it covers work
+       that never went through a spawn.
+    2. A ``spawned`` event — covers pre-``task_runs`` databases, whose
+       migration back-fills a synthetic run only for tasks that were
+       ``running`` at upgrade time. A legacy task that had already opened a
+       PR and gone back to ``ready`` shows zero runs, and without this second
+       marker it would read as never-run and lose the duplicate-PR guard.
+       Safe against ``gc_events`` (30-day retention) because the guard window
+       itself is 24h: a spawn that produced a PR comment inside the window
+       cannot have been pruned.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)
+    ).fetchone()
+    if row is not None:
+        return True
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'spawned' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
 def _has_fresh_continuation_signal(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8295,6 +8324,11 @@ def check_respawn_guard(
             whole-second timestamp ties), or an ``unblock`` recorded strictly
             after it. Either way the operator knowingly asked for more work
             (follow-up / rework); or
+          * the task has never been run at all (no ``task_runs`` row and no
+            ``spawned`` event). No worker of ours could have opened that PR,
+            so the link belongs to something else — typically a parent task's
+            PR quoted in the briefing — and guarding on it would deadlock the
+            task's very first spawn; or
           * the newest PR is actually ``closed`` / ``merged`` — there is no
             live PR left to duplicate. Live PR-state is consulted only when
             ``pr_state_resolver`` is supplied, or the built-in ``gh``-backed
@@ -8399,21 +8433,30 @@ def check_respawn_guard(
     #    presence of a PR link:
     #      a) find the NEWEST PR-URL comment in the window (older links are
     #         irrelevant — only the most recent PR could be duplicated);
-    #      b) if a deliberate continuation signal landed at/after it, the
+    #      b) if the task has no run history at all, that PR cannot be ours —
+    #         allow it (this is a first spawn, not a re-spawn);
+    #      c) if a deliberate continuation signal landed at/after it, the
     #         re-spawn is intentional rework — allow it;
-    #      c) if that PR is actually closed/merged, there is nothing live to
+    #      d) if that PR is actually closed/merged, there is nothing live to
     #         duplicate — allow it (only checked when a resolver is available;
     #         unknown state keeps the guard).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     newest_pr = _newest_pr_comment(conn, task_id, pr_cutoff)
     if newest_pr is not None:
         newest_pr_id, newest_pr_ts, newest_pr_url = newest_pr
-        # (b) deliberate continuation after the newest PR → intentional rework.
+        # (b) never-run task → this PR is not ours. The guard exists to stop a
+        #     *re*-spawn from duplicating a PR a previous worker opened; with
+        #     no run history there is no previous worker, and the link is
+        #     inherited context (e.g. the parent task's PR pasted into the
+        #     briefing). Blocking here would strand the first spawn forever.
+        if not _has_run_history(conn, task_id):
+            return None
+        # (c) deliberate continuation after the newest PR → intentional rework.
         if _has_fresh_continuation_signal(
             conn, task_id, newest_pr_ts, pr_comment_id=newest_pr_id
         ):
             return None
-        # (c) PR actually resolved (closed/merged) → nothing live to duplicate.
+        # (d) PR actually resolved (closed/merged) → nothing live to duplicate.
         resolver = pr_state_resolver
         if resolver is None and _resolve_pr_state_check_enabled():
             resolver = _resolve_github_pr_state

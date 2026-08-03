@@ -530,6 +530,24 @@ def _add_pr_comment_at(conn, task_id, created_at, url=_PR_URL):
     )
 
 
+def _add_prior_run(conn, task_id, *, outcome="crashed"):
+    """Record a finished run so the task reads as "already worked on".
+
+    Part of the fixture, not the thing under test: ``active_pr`` guards a
+    *re*-spawn, i.e. a task some earlier worker already ran and left a PR
+    behind. A task with zero runs cannot have opened the PR its comments
+    mention, so the guard deliberately stands down there (see the never-ran
+    tests below). ``crashed`` keeps block "3." (recent_success) and block
+    "1." (rate_limit_cooldown) out of the way.
+    """
+    ts = int(time.time()) - 3600
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, "
+        "outcome) VALUES (?, 'alice', 'released', ?, ?, ?)",
+        (task_id, ts, ts, outcome),
+    )
+
+
 # Fields ``gh pr view --json`` actually accepts (gh 2.x). ``merged`` is NOT
 # one of them — asking for it makes gh exit 1 with "Unknown JSON field",
 # which is the whole point of _fake_gh below.
@@ -586,6 +604,7 @@ def test_respawn_guard_active_pr_blocks_live_pr_without_signal(kanban_home):
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="live-pr", assignee="alice")
+        _add_prior_run(conn, t)
         kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
         reason = kb.check_respawn_guard(conn, t, pr_state_resolver=resolver)
 
@@ -599,6 +618,7 @@ def test_respawn_guard_active_pr_default_no_resolver_still_blocks(kanban_home):
     never consulted and an unknown state safely keeps the guard."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="live-pr", assignee="alice")
+        _add_prior_run(conn, t)
         kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "active_pr"
@@ -613,6 +633,7 @@ def test_respawn_guard_active_pr_cleared_by_unblock(kanban_home):
     """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="rework", assignee="alice")
+        _add_prior_run(conn, t)
         now = int(time.time())
         _add_pr_comment_at(conn, t, now - 100)
         conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (t,))
@@ -627,6 +648,7 @@ def test_respawn_guard_active_pr_cleared_by_unguard(kanban_home):
     """(b) The explicit operator override (clear_respawn_guard) clears it."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="unguard", assignee="alice")
+        _add_prior_run(conn, t)
         now = int(time.time())
         _add_pr_comment_at(conn, t, now - 100)
         assert (
@@ -646,6 +668,7 @@ def test_respawn_guard_active_pr_stale_signal_before_pr_still_blocks(kanban_home
     """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="stale-unblock", assignee="alice")
+        _add_prior_run(conn, t)
         now = int(time.time())
         conn.execute(
             "INSERT INTO task_events (task_id, kind, created_at) "
@@ -661,6 +684,7 @@ def test_respawn_guard_active_pr_closed_pr_not_guarded(kanban_home):
     """(c) A closed PR has nothing live to duplicate — guard steps aside."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="closed-pr", assignee="alice")
+        _add_prior_run(conn, t)
         kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
         reason = kb.check_respawn_guard(
             conn, t, pr_state_resolver=lambda url: "closed"
@@ -672,6 +696,7 @@ def test_respawn_guard_active_pr_merged_pr_not_guarded(kanban_home):
     """(c) A merged PR likewise no longer blocks re-spawn."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="merged-pr", assignee="alice")
+        _add_prior_run(conn, t)
         kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
         reason = kb.check_respawn_guard(
             conn, t, pr_state_resolver=lambda url: "merged"
@@ -684,6 +709,7 @@ def test_respawn_guard_active_pr_unknown_state_keeps_guard(kanban_home):
     duplicate-PR protection never silently drops on a transient gh failure."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="unknown-pr", assignee="alice")
+        _add_prior_run(conn, t)
         kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
         reason = kb.check_respawn_guard(
             conn, t, pr_state_resolver=lambda url: None
@@ -704,6 +730,7 @@ def test_respawn_guard_same_second_unblock_before_pr_still_blocks(kanban_home):
     """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="same-second", assignee="alice")
+        _add_prior_run(conn, t)
         now = int(time.time())
         conn.execute(
             "INSERT INTO task_events (task_id, kind, created_at) "
@@ -725,6 +752,7 @@ def test_respawn_guard_same_second_unguard_after_pr_clears(kanban_home):
     """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="same-second-unguard", assignee="alice")
+        _add_prior_run(conn, t)
         now = int(time.time())
         _add_pr_comment_at(conn, t, now)
         assert kb.check_respawn_guard(conn, t) == "active_pr"
@@ -749,6 +777,7 @@ def test_respawn_guard_unguard_does_not_cover_a_later_pr(kanban_home):
     later_url = "https://github.com/totemx-AI/subsidysmart/pull/99"
     with kb.connect() as conn:
         t = kb.create_task(conn, title="unguard-then-new-pr", assignee="alice")
+        _add_prior_run(conn, t)
         now = int(time.time())
         _add_pr_comment_at(conn, t, now - 100)
         assert kb.clear_respawn_guard(conn, t, actor="ops") is True
@@ -758,10 +787,73 @@ def test_respawn_guard_unguard_does_not_cover_a_later_pr(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_active_pr_never_ran_task_is_not_guarded(kanban_home):
+    """(b) A task that was never spawned cannot own the PR in its comments.
+
+    Reported shape: a fresh task is briefed with its parent's PR link (or any
+    related-work link) in the very first comment. The guard matched the URL and
+    deferred the task's FIRST spawn forever — there was no prior worker, so no
+    ``unblocked`` event and no ``done``→``ready`` transition ever arrived to
+    supersede it. Nothing of ours can be duplicated here, so the guard must
+    stand down. The resolver is deliberately made to say ``open``: the release
+    has to come from the missing run history, not from PR state.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="first-spawn", assignee="alice")
+        kb.add_comment(
+            conn, t, "ops", f"Context from the parent task: {_PR_URL}"
+        )
+        assert kb.latest_run(conn, t) is None
+        reason = kb.check_respawn_guard(
+            conn, t, pr_state_resolver=lambda url: "open"
+        )
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_one_prior_run_still_guards(kanban_home):
+    """The pair of the test above: a single finished run is enough to make the
+    PR link plausibly ours again, so the duplicate-PR protection comes back.
+
+    This is the line the never-ran release must not cross — it releases the
+    first spawn only, never a re-spawn.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="second-spawn", assignee="alice")
+        _add_prior_run(conn, t)
+        kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
+        reason = kb.check_respawn_guard(
+            conn, t, pr_state_resolver=lambda url: "open"
+        )
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_spawn_event_without_run_row_still_guards(
+    kanban_home,
+):
+    """Legacy databases: pre-``task_runs`` rows were back-filled only for tasks
+    that were ``running`` at upgrade time, so a task that had already opened a
+    PR and gone back to ``ready`` shows zero runs. A ``spawned`` event is the
+    second run-history marker that keeps such a task guarded — without it the
+    never-ran release would reintroduce the duplicate PR it protects against.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy-ran", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'spawned', ?)",
+            (t, int(time.time()) - 3600),
+        )
+        kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
+        assert kb.latest_run(conn, t) is None
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
 def test_clear_respawn_guard_records_the_pr_comment_it_covers(kanban_home):
     """The ordering marker is persisted, not recomputed at read time."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="marker", assignee="alice")
+        _add_prior_run(conn, t)
         _add_pr_comment_at(conn, t, int(time.time()))
         comment_id = conn.execute(
             "SELECT id FROM task_comments WHERE task_id = ?", (t,)
@@ -785,6 +877,7 @@ def test_respawn_guard_active_pr_matches_newest_pr_url(kanban_home):
     new_url = "https://github.com/totemx-AI/subsidysmart/pull/20"
     with kb.connect() as conn:
         t = kb.create_task(conn, title="multi-pr", assignee="alice")
+        _add_prior_run(conn, t)
         now = int(time.time())
         _add_pr_comment_at(conn, t, now - 100, url=old_url)
         _add_pr_comment_at(conn, t, now - 50, url=new_url)
@@ -805,6 +898,7 @@ def test_respawn_guard_active_pr_uses_builtin_resolver_when_enabled(
     )
     with kb.connect() as conn:
         t = kb.create_task(conn, title="builtin-on", assignee="alice")
+        _add_prior_run(conn, t)
         kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
         reason = kb.check_respawn_guard(conn, t)
     assert reason is None
@@ -824,6 +918,7 @@ def test_respawn_guard_active_pr_ignores_builtin_resolver_when_disabled(
     )
     with kb.connect() as conn:
         t = kb.create_task(conn, title="builtin-off", assignee="alice")
+        _add_prior_run(conn, t)
         kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "active_pr"
@@ -867,6 +962,7 @@ def test_respawn_guard_active_pr_config_enabled_closed_pr_clears(
     kb._PR_STATE_CACHE.clear()
     with kb.connect() as conn:
         t = kb.create_task(conn, title="cfg-closed", assignee="alice")
+        _add_prior_run(conn, t)
         kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
         reason = kb.check_respawn_guard(conn, t)
     assert reason is None
@@ -1000,6 +1096,7 @@ def test_dispatch_respawn_guard_active_pr_spawns_after_unguard(
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="pr-then-unguard", assignee="alice")
+        _add_prior_run(conn, t)
         now = int(time.time())
         _add_pr_comment_at(conn, t, now - 100)
         assert kb.check_respawn_guard(conn, t) == "active_pr"  # guarded before
