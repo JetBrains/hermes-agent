@@ -8585,15 +8585,22 @@ def _trim_slack_dm_cache() -> None:
         _slack_dm_cache.pop(next(iter(_slack_dm_cache)))
 
 
-async def _resolve_slack_user_dm(token: str, user_id: str) -> Optional[str]:
+async def _resolve_slack_user_dm(
+    token: str, user_id: str, base_url: Optional[str] = None
+) -> Optional[str]:
     """Resolve a Slack user ID (U.../W...) to a DM conversation ID (D...).
 
     ``chat.postMessage`` and ``files_upload_v2`` require a conversation ID; a
     DM must be opened first via ``conversations.open``.  Results are cached
-    per (token, user_id) pair to avoid redundant API calls.  Returns None if
-    resolution fails (missing ``im:write`` scope, unknown user, etc.).
+    per (base_url, token, user_id) triple to avoid redundant API calls — the
+    endpoint is part of the key because a custom Slack-compatible backend
+    hands out its own conversation IDs.  Returns None if resolution fails
+    (missing ``im:write`` scope, unknown user, etc.).
+
+    ``base_url`` must already be normalized (trailing slash) — see
+    ``_normalize_slack_base_url``. ``None`` means the real Slack endpoint.
     """
-    cache_key = f"{token}:{user_id}"
+    cache_key = f"{base_url or _DEFAULT_SLACK_BASE_URL}|{token}:{user_id}"
     if cache_key in _slack_dm_cache:
         return _slack_dm_cache[cache_key]
 
@@ -8604,9 +8611,12 @@ async def _resolve_slack_user_dm(token: str, user_id: str) -> Optional[str]:
     try:
         from gateway.platforms.base import proxy_kwargs_for_aiohttp
 
-        _proxy = resolve_proxy_url()
+        # NO_PROXY-aware for the built-in Slack hosts and any custom base_url
+        # host — a self-hosted endpoint is typically the reason a proxy must
+        # be bypassed in the first place.
+        _proxy = _resolve_slack_proxy_url(base_url)
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-        url = "https://slack.com/api/conversations.open"
+        url = (base_url or _DEFAULT_SLACK_BASE_URL) + "conversations.open"
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -8729,6 +8739,12 @@ async def _standalone_send(
         return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}
     token = tokens[0]
 
+    # base_url from PlatformConfig.extra (config.yaml), matching the in-process
+    # adapter. Resolved once here so every leg of this send — DM resolution,
+    # the media client, the text post — talks to the same endpoint.
+    _extra = getattr(pconfig, "extra", None) or {}
+    _base_url = _normalize_slack_base_url(_extra.get("base_url"))
+
     # User-targeted delivery: chat.postMessage / files_upload_v2 reject bare
     # user IDs (U.../W...) — resolve to a DM conversation ID (D...) first via
     # conversations.open so `deliver=slack:U…` cron jobs reach the user's DM
@@ -8737,7 +8753,7 @@ async def _standalone_send(
     if chat_id[:1] in ("U", "W"):
         resolved = None
         for _tok in tokens:
-            resolved = await _resolve_slack_user_dm(_tok, chat_id)
+            resolved = await _resolve_slack_user_dm(_tok, chat_id, _base_url)
             if resolved is not None:
                 token = _tok
                 break
@@ -8786,7 +8802,8 @@ async def _standalone_send(
             }
 
         client = _AsyncWebClient(token=token)
-        _apply_slack_proxy(client, resolve_proxy_url())
+        _apply_slack_base_url(client, _base_url)
+        _apply_slack_proxy(client, _resolve_slack_proxy_url(_base_url))
         last_message_id = None
 
         # Caption mode: skip a separate text post; comment rides the upload.
@@ -8892,10 +8909,6 @@ async def _standalone_send(
     try:
         from gateway.platforms.base import proxy_kwargs_for_aiohttp
 
-        _extra = getattr(pconfig, "extra", None) or {}
-        # base_url from PlatformConfig.extra (config.yaml), matching the
-        # in-process adapter.
-        _base_url = _normalize_slack_base_url(_extra.get("base_url"))
         # NO_PROXY-aware for the built-in Slack hosts and any custom base_url host.
         _proxy = resolve_proxy_url(target_hosts=_slack_proxy_bypass_hosts(_base_url))
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
