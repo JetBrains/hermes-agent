@@ -141,27 +141,14 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
-    monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
-
-    expected_profile = (
-        "Active Hermes profile: default. Other profiles (if any) live "
-        "under /hermes/profiles/<name>/. Each profile has its own skills/, "
-        "plugins/, cron/, and memories/ that affect a different session than "
-        "this one. Do not modify another profile's skills/plugins/cron/memories "
-        "unless the user explicitly directs you to."
+    # The profile block anchors on the ROOT hermes home
+    # (``get_default_hermes_root()``), not ``get_hermes_home()``: under a named
+    # profile the latter already points inside ``<root>/profiles/<name>``, so
+    # using it emitted self-nested paths like
+    # ``~/.hermes/profiles/coder/profiles/<name>``.
+    monkeypatch.setattr(
+        system_prompt, "get_default_hermes_root", lambda: Path("/hermes")
     )
-    expected = "\n\n".join((
-        "IDENTITY",
-        "HELP",
-        "STEER",
-        "CODING_STABLE",
-        "WORKSPACE",
-        "Operator instructions (from config):\nOPERATOR",
-        expected_profile,
-        "SYSTEM_MESSAGE",
-        "CONTEXT_FILES",
-        "Conversation started: Friday, January 02, 2026",
-    ))
 
     with (
         patch("run_agent.load_soul_md", return_value=""),
@@ -181,8 +168,30 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     ):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
-    assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    parts = prompt.split("\n\n")
+    # Order contract: identity/help/steer/coding-stable stay in the cacheable
+    # prefix, then workspace → operator instructions → profile block → system
+    # message → context files → timestamp.
+    assert parts[:6] == [
+        "IDENTITY",
+        "HELP",
+        "STEER",
+        "CODING_STABLE",
+        "WORKSPACE",
+        "Operator instructions (from config):\nOPERATOR",
+    ]
+    assert parts[7:] == [
+        "SYSTEM_MESSAGE",
+        "CONTEXT_FILES",
+        "Conversation started: Friday, January 02, 2026",
+    ]
+    profile_part = parts[6]
+    assert profile_part.startswith("Active Hermes profile: default.")
+    # Profiles are advertised under the ROOT home, never nested inside the
+    # active profile's own directory.
+    assert "/hermes/profiles/<name>" in profile_part
+    assert "profiles/<name>/profiles" not in profile_part
+    assert agent._cached_system_prompt_static == "\n\n".join(parts[:4])
 
 
 class TestTelegramRichMessagesHint:
