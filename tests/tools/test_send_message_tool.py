@@ -2005,3 +2005,94 @@ class TestTriggerGatewayAgentWake:
             assert build_session_key(woke) == build_session_key(original)
             # Never a synthetic placeholder user_id.
             assert woke.user_id != "hermes-internal-trigger"
+
+    @pytest.mark.asyncio
+    async def test_wake_source_carries_the_slack_workspace_scope(self):
+        """Slack keys include the workspace, so the wake must carry the team id.
+
+        The forged event's key must byte-match the key of the operator's
+        workspace-scoped source for the same channel.
+        """
+        from tools.send_message_tool import _trigger_gateway_agent
+        from gateway.session import SessionSource, build_session_key
+
+        captured: list = []
+
+        class _CaptureAdapter:
+            async def handle_message(self, event):
+                captured.append(event)
+
+        loop = asyncio.get_running_loop()
+
+        class _FakeRunner:
+            def __init__(self):
+                self.adapters = {Platform.SLACK: _CaptureAdapter()}
+                self._gateway_loop = loop
+                self._background_tasks: set = set()
+
+        runner = _FakeRunner()
+        original = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C0BCDG3H66P",
+            chat_type="group",
+            user_id="U0BCE4NRVKN",
+            scope_id="T0B8U2M6NRE",
+        )
+
+        with patch("gateway.run._gateway_runner_ref", new=lambda: runner):
+            result = await _trigger_gateway_agent(
+                "slack",
+                original.chat_id,
+                "task done",
+                chat_type="group",
+                user_id=original.user_id,
+                scope_id=original.scope_id,
+            )
+        assert result == {"triggered_agent": True}
+
+        for _ in range(20):
+            if captured:
+                break
+            await asyncio.sleep(0)
+        assert captured, "wake task did not run"
+
+        woke = captured[0].source
+        assert woke.scope_id == original.scope_id
+        assert build_session_key(woke) == build_session_key(original)
+        assert "T0B8U2M6NRE" in build_session_key(woke)
+
+    @pytest.mark.asyncio
+    async def test_unscoped_wake_keeps_its_previous_key(self):
+        """Without a scope the key keeps the plain platform/chat/user shape."""
+        from tools.send_message_tool import _trigger_gateway_agent
+        from gateway.session import build_session_key
+
+        captured: list = []
+
+        class _CaptureAdapter:
+            async def handle_message(self, event):
+                captured.append(event)
+
+        loop = asyncio.get_running_loop()
+
+        class _FakeRunner:
+            def __init__(self):
+                self.adapters = {Platform.TELEGRAM: _CaptureAdapter()}
+                self._gateway_loop = loop
+                self._background_tasks: set = set()
+
+        runner = _FakeRunner()
+        with patch("gateway.run._gateway_runner_ref", new=lambda: runner):
+            await _trigger_gateway_agent(
+                "telegram", "grp-9", "task done", chat_type="group", user_id="op-42",
+            )
+
+        for _ in range(20):
+            if captured:
+                break
+            await asyncio.sleep(0)
+        assert captured, "wake task did not run"
+
+        woke = captured[0].source
+        assert woke.scope_id is None
+        assert build_session_key(woke) == "agent:main:telegram:group:grp-9:op-42"

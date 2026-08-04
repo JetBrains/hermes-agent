@@ -293,6 +293,114 @@ async def test_notifier_wake_forwards_persisted_chat_type_and_user_id(kanban_hom
 
 
 @pytest.mark.asyncio
+async def test_notifier_wake_forwards_the_slack_workspace_scope(kanban_home):
+    """The wake carries the workspace on platforms whose keys include it.
+
+    Slack session keys embed the team id, so the active wake must forward the
+    workspace stored in the subscription's ``delivery_metadata`` to key to the
+    operator's real session.
+    """
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="slack wake", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="slack", chat_id="C0BCDG3H66P",
+            user_id="U0BCE4NRVKN", chat_type="group", delivery_mode="wake",
+            delivery_metadata={"slack_team_id": "T0B8U2M6NRE"},
+        )
+        kb.block_task(conn, tid, reason="slack block")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    # An empty adapter map must not win over the persisted workspace.
+    fake_adapter.scope_id_for_chat = lambda chat_id: None
+    runner.adapters = {Platform.SLACK: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    trigger_mock = AsyncMock(return_value={"triggered_agent": True})
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("tools.send_message_tool._trigger_gateway_agent", new=trigger_mock):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    trigger_mock.assert_awaited_once()
+    assert trigger_mock.await_args.kwargs.get("scope_id") == "T0B8U2M6NRE"
+
+
+@pytest.mark.asyncio
+async def test_notifier_wake_scope_falls_back_to_the_adapter_map(kanban_home):
+    """Subscriptions that stored no workspace resolve it from the adapter."""
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="slack wake fallback", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="slack", chat_id="C0BCDG3H66P",
+            chat_type="group", delivery_mode="wake",
+            delivery_metadata={"chat_type": "group"},
+        )
+        kb.block_task(conn, tid, reason="slack fallback block")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    fake_adapter.scope_id_for_chat = (
+        lambda chat_id: "T0B8U2M6NRE" if chat_id == "C0BCDG3H66P" else None
+    )
+    runner.adapters = {Platform.SLACK: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    trigger_mock = AsyncMock(return_value={"triggered_agent": True})
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("tools.send_message_tool._trigger_gateway_agent", new=trigger_mock):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    trigger_mock.assert_awaited_once()
+    assert trigger_mock.await_args.kwargs.get("scope_id") == "T0B8U2M6NRE"
+
+
+@pytest.mark.asyncio
 async def test_notifier_wake_only_skips_send_and_advances_cursor(kanban_home):
     """wake-only: NO passive send, the agent is woken exactly once, and the
     cursor advances so repeated ticks do not re-wake."""
