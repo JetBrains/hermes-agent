@@ -558,6 +558,7 @@ async def _trigger_gateway_agent(
     thread_id: str | None = None,
     chat_type: str | None = None,
     user_id: str | None = None,
+    scope_id: str | None = None,
 ) -> dict:
     """Schedule a synthetic inbound event so a live gateway agent takes a turn.
 
@@ -566,12 +567,14 @@ async def _trigger_gateway_agent(
     it to the destination adapter's ``handle_message`` on the gateway event
     loop, so the agent reads it, reasons, and replies in its own voice.
 
-    ``chat_type`` and ``user_id`` must mirror the originating source (persisted
-    on the subscription): ``handle_message`` derives the session key from them
-    via ``build_session_key``, so a mismatch routes the woken turn into a
-    separate, context-less session instead of the operator's real channel.
-    ``user_id`` is passed through verbatim (``None`` included), since for
-    group/channel keys an absent user_id is significant.
+    ``chat_type``, ``user_id`` and ``scope_id`` must mirror the originating
+    source (persisted on the subscription): ``handle_message`` derives the
+    session key from them via ``build_session_key``, so a mismatch routes the
+    woken turn into a separate, context-less session instead of the operator's
+    real channel. ``user_id`` is passed through verbatim (``None`` included),
+    since for group/channel keys an absent user_id is significant. ``scope_id``
+    is the tenant that owns the chat (the Slack workspace), which the key
+    includes ahead of the chat id; ``None`` for platforms without tenant scope.
 
     Not exposed to the model, so an LLM cannot wake itself. Returns
     ``{"triggered_agent": True}`` once the turn is queued, or
@@ -617,6 +620,7 @@ async def _trigger_gateway_agent(
         user_name="Hermes internal handoff",
         thread_id=thread_id,
         is_bot=False,
+        scope_id=str(scope_id) if scope_id else None,
     )
     event = MessageEvent(
         text=text,
