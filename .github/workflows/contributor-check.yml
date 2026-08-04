@@ -23,12 +23,33 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          # Fork upstream. Commits already reachable from its main are not
+          # ours to attribute (see below).
+          UPSTREAM_REPO_URL: https://github.com/NousResearch/hermes-agent.git
         run: |
           # Get the merge base between this PR and main
           MERGE_BASE=$(git merge-base origin/main HEAD)
 
+          # Fork note: an upstream-sync PR merges thousands of NousResearch
+          # commits into the fork, and every one of them is "new" relative to
+          # our main. Attributing upstream history is upstream's job — and
+          # their own catalog has gaps (their nousbot, contributors they never
+          # mapped), so this check failed on commits we did not author and
+          # cannot vouch for. Exclude everything already reachable from
+          # upstream's main; what remains is what the fork actually adds.
+          # If the fetch fails (offline, repo renamed), fall back to the full
+          # range instead of silently skipping the check.
+          EXCLUDE=""
+          if git fetch --no-tags --quiet "$UPSTREAM_REPO_URL" main; then
+            EXCLUDE="^FETCH_HEAD"
+            echo "Excluding commits reachable from upstream main ($(git rev-parse --short FETCH_HEAD))."
+          else
+            echo "::warning::Could not fetch upstream main; checking the full PR range."
+          fi
+
           # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD $EXCLUDE --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
