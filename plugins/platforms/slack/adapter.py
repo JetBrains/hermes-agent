@@ -755,6 +755,111 @@ def _apply_slack_base_url(client: Any, base_url: Optional[str]) -> None:
         client.base_url = base_url
 
 
+def _slack_url_origin(url: Optional[str]) -> Optional[Tuple[str, str, int]]:
+    """Return the ``(scheme, host, port)`` origin of *url*, or ``None``.
+
+    ``None`` for anything unusable (blank, non-HTTP scheme, no host, invalid
+    port) so callers never treat a malformed URL as a match. The port is
+    defaulted per scheme, making ``https://host/`` and ``https://host:443/``
+    the same origin.
+    """
+    if not url:
+        return None
+    try:
+        parts = urlsplit(str(url).strip())
+    except Exception:
+        return None
+    scheme = (parts.scheme or "").strip().lower()
+    if scheme not in {"http", "https"}:
+        return None
+    host = (parts.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return (scheme, host, port)
+
+
+def _slack_trusted_origin_label(base_url: Optional[str]) -> Optional[str]:
+    """Render the trusted origin of *base_url* as ``scheme://host[:port]``.
+
+    Used in refusal messages so an operator can see *which* origin is trusted:
+    the trust is exact-origin, so a relay that serves files from a sibling host
+    (mirroring ``slack.com`` vs ``files.slack.com``) is refused, and without
+    the origin in the message that failure is indistinguishable from a genuine
+    SSRF block. ``None`` when no usable custom base URL is configured.
+    """
+    origin = _slack_url_origin(base_url)
+    if origin is None:
+        return None
+    scheme, host, port = origin
+    if port == (443 if scheme == "https" else 80):
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"
+
+
+def _slack_trust_hint(base_url: Optional[str]) -> str:
+    """Trailing clause naming the trusted origins for a refusal message."""
+    trusted = _slack_trusted_origin_label(base_url)
+    if not trusted:
+        return ""
+    return (
+        f" (trusted: the Slack CDN, plus exactly {trusted} from slack.base_url "
+        "— scheme, host and port must all match, sibling hosts are not covered)"
+    )
+
+
+def _is_slack_base_url_origin(url: str, base_url: Optional[str]) -> bool:
+    """Return True when *url* lives on the configured custom Slack origin.
+
+    ``url_private`` / ``url_private_download`` values are minted by whatever
+    Slack endpoint the workspace actually talks to. With a custom
+    ``slack.base_url`` (self-hosted relay, Enterprise proxy, mock Slack) those
+    links point at that endpoint instead of the Slack CDN, so the inbound file
+    download guards have to trust it — the same trust ``_apply_slack_base_url``
+    already grants it for every Web API call.
+
+    Origin equality (scheme + host + port) is the whole test: it cannot be
+    steered by a forged file object, because the origin comes from local
+    config. With no ``base_url`` configured this always returns False, leaving
+    the Slack-CDN allowlist as the only trust source.
+    """
+    origin = _slack_url_origin(base_url)
+    return origin is not None and _slack_url_origin(url) == origin
+
+
+def _slack_base_url_redirect_guard(base_url: Optional[str]) -> Any:
+    """Build a redirect guard that pins every hop to the custom Slack origin.
+
+    A custom endpoint may legitimately 3xx inside its own origin (auth
+    handoff, path rewrite), so those hops pass. Anything that leaves the
+    origin is refused outright rather than deferred to the generic
+    private-IP guard: this client is a plain ``httpx.AsyncClient`` (the
+    DNS-pinned one cannot dial a relay on a private address), so an
+    off-origin hop would be validated by hostname only and reopen the
+    DNS-rebinding window between the check and the TCP connect — with the
+    bot token attached.
+    """
+    from gateway.platforms.base import safe_url_for_log
+
+    async def guard(response: Any) -> None:
+        from tools.url_safety import redirect_target_from_response
+
+        target = redirect_target_from_response(response)
+        if target and not _is_slack_base_url_origin(target, base_url):
+            raise ValueError(
+                "Blocked Slack file redirect off the configured base_url "
+                f"origin {_slack_trusted_origin_label(base_url)}: "
+                f"{safe_url_for_log(target)}"
+            )
+
+    return guard
+
+
 _SLACK_PROXY_HOSTS = (
     "slack.com",
     "files.slack.com",
@@ -8142,6 +8247,71 @@ class SlackAdapter(BasePlatformAdapter):
             cls._SLACK_CDN_HOST_SUFFIXES
         )
 
+    def _open_slack_file_client(self, url: str) -> Any:
+        """Validate an inbound file URL and open the client to download it with.
+
+        Raises ``ValueError`` when the URL must not receive the bot token. The
+        returned object is an ``httpx.AsyncClient`` async context manager.
+
+        Two trust paths:
+
+        * Slack CDN (the default): pre-flight ``is_safe_url`` + CDN allowlist +
+          a DNS-pinned client, unchanged from upstream.
+        * The configured custom ``slack.base_url`` origin: the private-IP
+          checks are skipped for that origin only, because a self-hosted relay
+          legitimately lives on localhost / an internal address. In exchange
+          the client is origin-pinned — every redirect that leaves the trusted
+          origin is refused, so the token never follows a hop we cannot vet.
+        """
+        import httpx
+        from gateway.platforms.base import _ssrf_redirect_guard, safe_url_for_log
+        from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+
+        base_url = self._resolve_slack_base_url()
+        if _is_slack_base_url_origin(url, base_url):
+            logger.debug(
+                "[Slack] Trusting file URL on the configured base_url origin: %s",
+                safe_url_for_log(url),
+            )
+            return httpx.AsyncClient(
+                timeout=30.0,
+                follow_redirects=True,
+                event_hooks={"response": [_slack_base_url_redirect_guard(base_url)]},
+            )
+
+        # SSRF guard: the download attaches the bot token, so a URL that
+        # resolves to (or 3xx-redirects into) a private/internal address would
+        # both leak the token and let the server reach internal services
+        # (CWE-918). The outbound send_image() path is already guarded; this
+        # is the inbound sibling that was missing the same protection.
+        if not is_safe_url(url):
+            raise ValueError(
+                "Blocked unsafe Slack file URL (SSRF protection): "
+                f"{safe_url_for_log(url)}{_slack_trust_hint(base_url)}"
+            )
+
+        # Tighter than the generic SSRF check: these URLs come from Slack file
+        # objects (``url_private`` / ``url_private_download``) and legitimately
+        # only ever point at the Slack CDN — or at the configured custom
+        # endpoint, handled above. Refusing everything else stops a forged file
+        # object from steering the Bearer-token download at an arbitrary public
+        # host (token exfiltration), which the private-IP check alone cannot
+        # prevent.
+        if not self._is_slack_cdn_url(url):
+            raise ValueError(
+                "Blocked non-Slack-CDN file URL (token-exfiltration protection): "
+                f"{safe_url_for_log(url)}{_slack_trust_hint(base_url)}"
+            )
+
+        # DNS-pinned client: resolve + validate once, dial the vetted IP
+        # (closes the DNS-rebinding TOCTOU window between is_safe_url and
+        # TCP connect — the redirect hook still re-validates every hop).
+        return create_ssrf_safe_async_client(
+            timeout=30.0,
+            follow_redirects=True,
+            event_hooks={"response": [_ssrf_redirect_guard]},
+        )
+
     def _resolve_download_token(self, url: str, team_id: str = "") -> str:
         """Pick the correct bot token for a Slack file download.
 
@@ -8172,41 +8342,14 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> str:
         """Download a Slack file using the bot token for auth, with retry."""
         import httpx
-        from gateway.platforms.base import _ssrf_redirect_guard, safe_url_for_log
-        from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
 
-        # SSRF guard: the download attaches the bot token, so a URL that
-        # resolves to (or 3xx-redirects into) a private/internal address would
-        # both leak the token and let the server reach internal services
-        # (CWE-918). The outbound send_image() path is already guarded; this
-        # is the inbound sibling that was missing the same protection.
-        if not is_safe_url(url):
-            raise ValueError(
-                f"Blocked unsafe Slack file URL (SSRF protection): {safe_url_for_log(url)}"
-            )
-
-        # Tighter than the generic SSRF check: these URLs come from Slack file
-        # objects (``url_private`` / ``url_private_download``) and legitimately
-        # only ever point at the Slack CDN. Refusing everything else stops a
-        # forged file object from steering the Bearer-token download at an
-        # arbitrary public host (token exfiltration), which the private-IP
-        # check alone cannot prevent.
-        if not self._is_slack_cdn_url(url):
-            raise ValueError(
-                "Blocked non-Slack-CDN file URL (token-exfiltration protection): "
-                f"{safe_url_for_log(url)}"
-            )
+        # URL trust policy + client construction live in one place so both
+        # download paths (this one and _download_slack_file_bytes) stay in sync.
+        client_cm = self._open_slack_file_client(url)
 
         bot_token = self._resolve_download_token(url, team_id)
 
-        # DNS-pinned client: resolve + validate once, dial the vetted IP
-        # (closes the DNS-rebinding TOCTOU window between is_safe_url and
-        # TCP connect — the redirect hook still re-validates every hop).
-        async with create_ssrf_safe_async_client(
-            timeout=30.0,
-            follow_redirects=True,
-            event_hooks={"response": [_ssrf_redirect_guard]},
-        ) as client:
+        async with client_cm as client:
             for attempt in range(3):
                 try:
                     response = await client.get(
@@ -8255,34 +8398,14 @@ class SlackAdapter(BasePlatformAdapter):
     async def _download_slack_file_bytes(self, url: str, team_id: str = "") -> bytes:
         """Download a Slack file and return raw bytes, with retry."""
         import httpx
-        from gateway.platforms.base import _ssrf_redirect_guard, safe_url_for_log
-        from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
 
-        # SSRF guard (CWE-918): see _download_slack_file. This sibling path
-        # also attaches the bot token and must validate the destination plus
-        # every redirect hop.
-        if not is_safe_url(url):
-            raise ValueError(
-                f"Blocked unsafe Slack file URL (SSRF protection): {safe_url_for_log(url)}"
-            )
-
-        # Slack-CDN allowlist — see _download_slack_file for the rationale.
-        if not self._is_slack_cdn_url(url):
-            raise ValueError(
-                "Blocked non-Slack-CDN file URL (token-exfiltration protection): "
-                f"{safe_url_for_log(url)}"
-            )
+        # Same trust policy as _download_slack_file (CWE-918 pre-flight, CDN /
+        # custom-base_url allowlist, per-redirect guard).
+        client_cm = self._open_slack_file_client(url)
 
         bot_token = self._resolve_download_token(url, team_id)
 
-        # DNS-pinned client: resolve + validate once, dial the vetted IP
-        # (closes the DNS-rebinding TOCTOU window between is_safe_url and
-        # TCP connect — the redirect hook still re-validates every hop).
-        async with create_ssrf_safe_async_client(
-            timeout=30.0,
-            follow_redirects=True,
-            event_hooks={"response": [_ssrf_redirect_guard]},
-        ) as client:
+        async with client_cm as client:
             for attempt in range(3):
                 try:
                     response = await client.get(
