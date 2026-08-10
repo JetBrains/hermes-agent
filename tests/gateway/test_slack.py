@@ -5417,3 +5417,170 @@ class TestSlackUserAgent:
         elsewhere in the codebase for platform-partner attribution."""
         assert _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX.startswith("HermesAgent/")
 
+
+# ---------------------------------------------------------------------------
+# TestSlackAuthoredTextDeduplication
+# ---------------------------------------------------------------------------
+
+
+# A "Copy link" URL for a Slack thread always carries query parameters, so
+# Slack HTML-escapes the ``&`` in ``event.text`` while leaving the same URL
+# raw inside ``blocks[].link.url``.
+_THREAD_PERMALINK = (
+    "https://example.slack.com/archives/C0BCDG3H66P/p1786102118226679"
+    "?thread_ts=1786102118.226679&cid=C0BCDG3H66P"
+)
+_THREAD_PERMALINK_ESCAPED = _THREAD_PERMALINK.replace("&", "&amp;")
+
+
+class TestSlackAuthoredTextDeduplication:
+    """One authored Slack message must never be appended to itself.
+
+    Slack delivers the same authored text twice — flat in ``event.text`` and
+    structurally in ``event.blocks`` — and HTML-escapes ``&``/``<``/``>`` in
+    the flat copy only. Whenever the two representations fail to compare
+    equal, the block rendering is mistaken for additional content and the
+    user sees their own message twice. Both merge sites are covered:
+    ``_handle_slack_message`` (live inbound) and ``_render_message_text``
+    (thread/parent hydration).
+    """
+
+    @staticmethod
+    def _thread_link_blocks(*trailing):
+        return _rich_text_blocks(
+            _rich_text_section(
+                {"type": "user", "user_id": "U_BOT"},
+                {"type": "text", "text": " do you see "},
+                {"type": "link", "url": _THREAD_PERMALINK},
+                {"type": "text", "text": " ?"},
+            ),
+            *trailing,
+        )
+
+    @staticmethod
+    def _thread_link_text():
+        return f"<@U_BOT> do you see <{_THREAD_PERMALINK_ESCAPED}> ?"
+
+    # -- helper-level equivalence -----------------------------------------
+
+    @pytest.mark.parametrize(
+        "flat_text,elements",
+        [
+            # Thread permalink: query params make Slack escape ``&`` in text
+            # while ``blocks[].link.url`` stays raw. The reported bug.
+            (
+                f"look <{_THREAD_PERMALINK_ESCAPED}> here",
+                [
+                    {"type": "text", "text": "look "},
+                    {"type": "link", "url": _THREAD_PERMALINK},
+                    {"type": "text", "text": " here"},
+                ],
+            ),
+            # Bare ampersand in prose.
+            ("AT&amp;T outage", [{"type": "text", "text": "AT&T outage"}]),
+            # Literal angle brackets the user typed.
+            ("use &lt;div&gt; here", [{"type": "text", "text": "use <div> here"}]),
+            # Labelled link whose label carries an ampersand.
+            (
+                "see <https://x.example|AT&amp;T>",
+                [
+                    {"type": "text", "text": "see "},
+                    {"type": "link", "url": "https://x.example", "text": "AT&T"},
+                ],
+            ),
+        ],
+    )
+    def test_escaped_entities_compare_equal(self, flat_text, elements):
+        assert (
+            _slack_mod._extract_additional_text_from_slack_blocks(
+                _rich_text_blocks(_rich_text_section(*elements)), flat_text
+            )
+            == ""
+        )
+
+    def test_genuine_quote_still_appended_next_to_escaped_link(self):
+        """Negative case: the fix must not swallow real structured content."""
+        blocks = self._thread_link_blocks(
+            {
+                "type": "rich_text_quote",
+                "elements": [
+                    _rich_text_section({"type": "text", "text": "quoted context"})
+                ],
+            }
+        )
+
+        assert (
+            _slack_mod._extract_additional_text_from_slack_blocks(
+                blocks, self._thread_link_text(), bot_uid="U_BOT"
+            )
+            == "> quoted context"
+        )
+
+    # -- live inbound path -------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_live_inbound_thread_permalink_not_duplicated(self, adapter):
+        await adapter._handle_slack_message(
+            {
+                "text": self._thread_link_text(),
+                "blocks": self._thread_link_blocks(),
+                "user": "U_USER",
+                "client_msg_id": "cm-1",
+                "channel": "D_DM",
+                "channel_type": "im",
+                "ts": "123.456",
+                "team": "T_TEAM",
+            }
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        text = adapter.handle_message.await_args.args[0].text
+        assert text.count("p1786102118226679") == 1
+        assert text.count("do you see") == 1
+
+    # -- thread/parent hydration path --------------------------------------
+
+    def test_hydration_thread_permalink_not_duplicated(self, adapter):
+        rendered = adapter._render_message_text(
+            {"text": self._thread_link_text(), "blocks": self._thread_link_blocks()},
+            bot_uid="U_BOT",
+        )
+
+        assert rendered.count("p1786102118226679") == 1
+        assert rendered.count("do you see") == 1
+
+    def test_hydration_skips_message_unfurl_attachment(self, adapter):
+        """A permalink unfurl echoes the *linked* message — the live path
+        already skips it, so hydration must not re-append it either."""
+        rendered = adapter._render_message_text(
+            {
+                "text": f"<{_THREAD_PERMALINK_ESCAPED}>",
+                "attachments": [
+                    {
+                        "is_msg_unfurl": True,
+                        "text": "the linked message body",
+                        "fallback": "linked message fallback",
+                    }
+                ],
+            }
+        )
+
+        assert "the linked message body" not in rendered
+        assert "linked message fallback" not in rendered
+
+    def test_hydration_still_surfaces_regular_attachments(self, adapter):
+        """Alert-bot content lives only in attachments — keep surfacing it."""
+        rendered = adapter._render_message_text(
+            {
+                "text": "",
+                "attachments": [
+                    {"is_msg_unfurl": True, "text": "echoed message body"},
+                    {"title": "FiringAlert", "text": "disk usage 95%"},
+                ],
+            }
+        )
+
+        assert "echoed message body" not in rendered
+        assert "FiringAlert" in rendered
+        assert "disk usage 95%" in rendered
+
