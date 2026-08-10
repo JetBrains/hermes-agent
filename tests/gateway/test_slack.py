@@ -5584,3 +5584,77 @@ class TestSlackAuthoredTextDeduplication:
         assert "FiringAlert" in rendered
         assert "disk usage 95%" in rendered
 
+    # -- Block Kit payload dump --------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_block_kit_dump_leaves_out_the_authored_rich_text(self, adapter):
+        """A single non-rich_text block must not drag the message in with it.
+
+        The dump exists for the interactive blocks bots post, and its
+        allowlist deliberately drops ``url``. Serializing the authored
+        ``rich_text`` alongside them therefore repeats the user's own
+        sentence with its links deleted — the "second copy without the
+        link" a reporter sees.
+        """
+        await adapter._handle_slack_message(
+            {
+                "text": self._thread_link_text(),
+                "blocks": self._thread_link_blocks()
+                + [{"type": "section", "text": {"type": "mrkdwn", "text": "extra"}}],
+                "user": "U_USER",
+                "client_msg_id": "cm-2",
+                "channel": "D_DM",
+                "channel_type": "im",
+                "ts": "123.457",
+                "team": "T_TEAM",
+            }
+        )
+
+        text = adapter.handle_message.await_args.args[0].text
+        assert text.count("do you see") == 1
+        assert text.count("p1786102118226679") == 1
+        # The block the agent cannot otherwise read is still surfaced.
+        assert "extra" in text
+
+    @pytest.mark.asyncio
+    async def test_no_block_kit_dump_for_a_plain_authored_message(self, adapter):
+        await adapter._handle_slack_message(
+            {
+                "text": self._thread_link_text(),
+                "blocks": self._thread_link_blocks(),
+                "user": "U_USER",
+                "client_msg_id": "cm-3",
+                "channel": "D_DM",
+                "channel_type": "im",
+                "ts": "123.458",
+                "team": "T_TEAM",
+            }
+        )
+
+        text = adapter.handle_message.await_args.args[0].text
+        assert "[Slack Block Kit payload for this message]" not in text
+
+    def test_block_kit_dump_still_describes_bot_ui_blocks(self):
+        """Negative case: UI-heavy bot blocks are why the dump exists."""
+        payload = _slack_mod._serialize_slack_blocks_for_agent(
+            [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "Deploy failed"},
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "rollback",
+                            "text": {"type": "plain_text", "text": "Roll back"},
+                        }
+                    ],
+                },
+            ]
+        )
+
+        assert "Deploy failed" in payload
+        assert "rollback" in payload
+        assert "Roll back" in payload

@@ -628,11 +628,21 @@ def _extract_additional_text_from_slack_blocks(
 
 
 def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> str:
-    """Return a compact, redacted JSON view of the current message's Block Kit payload."""
-    if not blocks:
-        return ""
+    """Return a compact, redacted JSON view of the current message's Block Kit payload.
 
-    if all((block or {}).get("type") == "rich_text" for block in blocks):
+    Only blocks the agent cannot already read are serialized. ``rich_text``
+    blocks are the authored message itself and are rendered into the message
+    text by :func:`_extract_text_from_slack_blocks`; dumping them here would
+    repeat the author's own words — and, because the allowlist below drops
+    ``url``, the repeat reads as the same sentence with every link silently
+    removed. This view exists for the UI-heavy blocks bots post (``section``,
+    ``actions``, ``accessory``, …), so a single such block must not drag the
+    authored text along with it.
+    """
+    inspectable = [
+        block for block in (blocks or []) if (block or {}).get("type") != "rich_text"
+    ]
+    if not inspectable:
         return ""
 
     scalar_allowlist = {
@@ -684,9 +694,9 @@ def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> st
         return repr(value)
 
     try:
-        payload = json.dumps(_sanitize(blocks), ensure_ascii=False, indent=2)
+        payload = json.dumps(_sanitize(inspectable), ensure_ascii=False, indent=2)
     except Exception:
-        payload = repr(blocks)
+        payload = repr(inspectable)
 
     if len(payload) > max_chars:
         payload = payload[: max_chars - 18].rstrip() + "\n... [truncated]"
