@@ -782,13 +782,12 @@ def _slack_url_origin(url: Optional[str]) -> Optional[Tuple[str, str, int]]:
 
 
 def _slack_trusted_origin_label(base_url: Optional[str]) -> Optional[str]:
-    """Render the trusted origin of *base_url* as ``scheme://host[:port]``.
+    """Render the origin of *base_url* as ``scheme://host[:port]``.
 
-    Used in refusal messages so an operator can see *which* origin is trusted:
-    the trust is exact-origin, so a relay that serves files from a sibling host
-    (mirroring ``slack.com`` vs ``files.slack.com``) is refused, and without
-    the origin in the message that failure is indistinguishable from a genuine
-    SSRF block. ``None`` when no usable custom base URL is configured.
+    Used in refusal messages so an operator can see which endpoint is
+    trusted; without it, a URL that simply sits outside the configured
+    endpoint is indistinguishable from a genuine SSRF block. ``None`` when no
+    usable custom base URL is configured.
     """
     origin = _slack_url_origin(base_url)
     if origin is None:
@@ -800,18 +799,18 @@ def _slack_trusted_origin_label(base_url: Optional[str]) -> Optional[str]:
 
 
 def _slack_trust_hint(base_url: Optional[str]) -> str:
-    """Trailing clause naming the trusted origins for a refusal message."""
+    """Trailing clause naming the trusted endpoint for a refusal message."""
     trusted = _slack_trusted_origin_label(base_url)
     if not trusted:
         return ""
     return (
-        f" (trusted: the Slack CDN, plus exactly {trusted} from slack.base_url "
-        "— scheme, host and port must all match, sibling hosts are not covered)"
+        f" (trusted: the Slack CDN, plus {trusted} and hosts below it from "
+        "slack.base_url — scheme and port must match too)"
     )
 
 
-def _is_slack_base_url_origin(url: str, base_url: Optional[str]) -> bool:
-    """Return True when *url* lives on the configured custom Slack origin.
+def _is_slack_base_url_trusted(url: str, base_url: Optional[str]) -> bool:
+    """Return True when *url* lives on the configured custom Slack endpoint.
 
     ``url_private`` / ``url_private_download`` values are minted by whatever
     Slack endpoint the workspace actually talks to. With a custom
@@ -820,26 +819,40 @@ def _is_slack_base_url_origin(url: str, base_url: Optional[str]) -> bool:
     download guards have to trust it — the same trust ``_apply_slack_base_url``
     already grants it for every Web API call.
 
-    Origin equality (scheme + host + port) is the whole test: it cannot be
-    steered by a forged file object, because the origin comes from local
+    Trust covers the configured host *and hosts below it*, on the same scheme
+    and port. Slack itself splits the Web API (``slack.com``) from file
+    content (``files.slack.com``), so a Slack-compatible deployment mirrors
+    that split under its own host and hands out file links on a subdomain of
+    ``base_url``; this is the same shape as the Slack-CDN allowlist
+    (``slack.com`` plus ``*.slack.com``). It cannot be steered by a forged
+    file object, because the host everything is anchored to comes from local
     config. With no ``base_url`` configured this always returns False, leaving
     the Slack-CDN allowlist as the only trust source.
+
+    Callers check the CDN allowlist first: a ``base_url`` on Slack itself
+    must not turn CDN links into "configured" ones, which would cost them
+    ``is_safe_url`` and the DNS-pinned client.
     """
     origin = _slack_url_origin(base_url)
-    return origin is not None and _slack_url_origin(url) == origin
+    target = _slack_url_origin(url)
+    if origin is None or target is None:
+        return False
+    scheme, host, port = origin
+    if (target[0], target[2]) != (scheme, port):
+        return False
+    return target[1] == host or target[1].endswith("." + host)
 
 
 def _slack_base_url_redirect_guard(base_url: Optional[str]) -> Any:
-    """Build a redirect guard that pins every hop to the custom Slack origin.
+    """Build a redirect guard that pins every hop to the custom Slack endpoint.
 
-    A custom endpoint may legitimately 3xx inside its own origin (auth
-    handoff, path rewrite), so those hops pass. Anything that leaves the
-    origin is refused outright rather than deferred to the generic
-    private-IP guard: this client is a plain ``httpx.AsyncClient`` (the
-    DNS-pinned one cannot dial a relay on a private address), so an
-    off-origin hop would be validated by hostname only and reopen the
-    DNS-rebinding window between the check and the TCP connect — with the
-    bot token attached.
+    A custom endpoint may legitimately 3xx within itself (auth handoff, path
+    rewrite, API host to file host), so those hops pass. Anything that leaves
+    it is refused outright rather than deferred to the generic private-IP
+    guard: this client is a plain ``httpx.AsyncClient`` (the DNS-pinned one
+    cannot dial a relay on a private address), so such a hop would be
+    validated by hostname only and reopen the DNS-rebinding window between the
+    check and the TCP connect — with the bot token attached.
     """
     from gateway.platforms.base import safe_url_for_log
 
@@ -847,10 +860,10 @@ def _slack_base_url_redirect_guard(base_url: Optional[str]) -> Any:
         from tools.url_safety import redirect_target_from_response
 
         target = redirect_target_from_response(response)
-        if target and not _is_slack_base_url_origin(target, base_url):
+        if target and not _is_slack_base_url_trusted(target, base_url):
             raise ValueError(
                 "Blocked Slack file redirect off the configured base_url "
-                f"origin {_slack_trusted_origin_label(base_url)}: "
+                f"endpoint {_slack_trusted_origin_label(base_url)}: "
                 f"{safe_url_for_log(target)}"
             )
 
@@ -8319,22 +8332,30 @@ class SlackAdapter(BasePlatformAdapter):
 
         Two trust paths:
 
-        * Slack CDN (the default): pre-flight ``is_safe_url`` + CDN allowlist +
-          a DNS-pinned client, unchanged from upstream.
-        * The configured custom ``slack.base_url`` origin: the private-IP
-          checks are skipped for that origin only, because a self-hosted relay
-          legitimately lives on localhost / an internal address. In exchange
-          the client is origin-pinned — every redirect that leaves the trusted
-          origin is refused, so the token never follows a hop we cannot vet.
+        * Slack CDN — checked first, so a ``base_url`` on Slack itself never
+          weakens it: pre-flight ``is_safe_url`` + CDN allowlist + a
+          DNS-pinned client.
+        * A custom (non-Slack) ``slack.base_url`` endpoint — its host and
+          hosts below it: the private-IP checks are skipped there only,
+          because a self-hosted relay legitimately lives on localhost / an
+          internal address. In exchange the client is pinned to that endpoint
+          — every redirect that leaves it is refused, so the token never
+          follows a hop we cannot vet.
         """
         import httpx
         from gateway.platforms.base import _ssrf_redirect_guard, safe_url_for_log
         from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
 
         base_url = self._resolve_slack_base_url()
-        if _is_slack_base_url_origin(url, base_url):
+        # CDN first: a base_url on Slack itself (``https://slack.com/api/``,
+        # or an Enterprise ``*.slack.com`` endpoint) would otherwise make
+        # every real CDN link "configured", dropping is_safe_url and the
+        # DNS-pinned client for downloads that never needed either.
+        if not self._is_slack_cdn_url(url) and _is_slack_base_url_trusted(
+            url, base_url
+        ):
             logger.debug(
-                "[Slack] Trusting file URL on the configured base_url origin: %s",
+                "[Slack] Trusting file URL on the configured base_url endpoint: %s",
                 safe_url_for_log(url),
             )
             return httpx.AsyncClient(

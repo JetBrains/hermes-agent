@@ -483,24 +483,37 @@ custom endpoint must implement that method too.
 Incoming attachments — images, voice clips, PDFs, anything else — are fetched
 from the `url_private` / `url_private_download` links in the event payload, and
 those links are minted by whatever endpoint the workspace actually talks to. So
-`base_url` governs downloads too: **file URLs on that exact origin are trusted**
-for inbound downloads. Concretely, for that origin only:
+`base_url` governs downloads too: **file URLs on that endpoint are trusted** for
+inbound downloads. Concretely, there only:
 
 - the URL may resolve to a **private or loopback address**
   (`http://127.0.0.1:49917/files/…`) — the usual SSRF block that protects the
   bot token does not apply to an endpoint you configured yourself;
-- **redirects are pinned to the origin.** Your endpoint may `3xx` within itself
-  (auth handoff, path rewrite), but any hop that leaves the origin is refused,
-  because the bot token travels with the request.
+- **redirects are pinned to the endpoint.** It may `3xx` within itself (auth
+  handoff, path rewrite, API host to file host), but any hop that leaves it is
+  refused, because the bot token travels with the request.
 
-"Exact origin" means **scheme + host + port must all match** `base_url`. A
-sibling host is *not* covered: if your relay mirrors Slack's own split
-(`slack.com` for the API, `files.slack.com` for files) and hands out file links
-on a different hostname than `base_url`, those downloads are refused — the
-refusal in `~/.hermes/logs/gateway.log` names the trusted origin so the
-mismatch is obvious. Serve files from the same origin as the API (e.g. a
-`/files/…` path under it), or point `base_url` at the host that mints the file
-links.
+"That endpoint" means the **host of `base_url` and any host below it**, on the
+same scheme and port — the same shape as the Slack-CDN allowlist. Slack splits
+the API (`slack.com`) from file content (`files.slack.com`), so a deployment
+mirroring that split serves files from `files.slack.internal.corp` while
+`base_url` is `https://slack.internal.corp/api/`, and those downloads are
+trusted. A host that is *not* below `base_url` is refused, including its parent
+domain (`internal.corp`) and that parent's other children
+(`files.internal.corp`); the refusal in `~/.hermes/logs/gateway.log` names the
+trusted endpoint so the mismatch is obvious. Serve file content below the host
+`base_url` names.
+
+Pointing `base_url` at Slack itself (`https://slack.com/api/`, or an Enterprise
+`*.slack.com` endpoint) changes nothing for downloads: Slack's own CDN hosts keep
+the standard path, with the SSRF pre-flight and the DNS-pinned client intact.
+
+If your endpoint fronts the real Slack rather than serving the workspace
+itself, the file links it passes through still point at `https://files.slack.com/…`
+and are fetched from Slack directly. Rewrite them to your own host in the
+endpoint's API responses (and in Socket Mode frames) if downloads have to go
+through it — for example when only the endpoint holds a usable bot token, as
+the CDN then answers with an HTML login page instead of file bytes.
 
 Without a custom `base_url` nothing changes: inbound file URLs are accepted only
 on Slack's own CDN hosts (`slack.com`, `slack-files.com` and their subdomains)
