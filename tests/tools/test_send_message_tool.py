@@ -319,23 +319,13 @@ class TestSlackDmBaseUrl:
 
 
 class TestSlackDmProxyBypass:
-    """DM resolution must tell resolve_proxy_url which hosts it targets.
+    """NO_PROXY applies to the endpoint DM resolution actually talks to.
 
-    ``resolve_proxy_url`` only consults NO_PROXY when ``target_hosts`` is
-    passed, so calling it bare sent conversations.open through the corporate
-    proxy even when the operator excluded the (usually private) Slack host.
+    ``resolve_proxy_url`` consults NO_PROXY only for the hosts it is told
+    about, and bypasses as soon as any of them matches.
     """
 
     BASE = "https://slack.internal.corp/api/"
-
-    def test_target_hosts_cover_slack_and_the_custom_host(self):
-        from tools.send_message_tool import _slack_proxy_target_hosts
-
-        hosts = _slack_proxy_target_hosts(self.BASE)
-        assert "slack.internal.corp" in hosts
-        assert "slack.com" in hosts
-        # The default endpoint needs no extra host beyond the built-ins.
-        assert "slack.com" in _slack_proxy_target_hosts("https://slack.com/api/")
 
     @staticmethod
     def _fake_aiohttp(monkeypatch, calls):
@@ -370,6 +360,13 @@ class TestSlackDmProxyBypass:
         )
 
     def _resolve(self, monkeypatch, env):
+        """Run the DM leg and return the proxy URL it resolved.
+
+        That URL is the proxy decision itself; the kwargs it turns into are
+        transport detail — with aiohttp-socks installed every scheme travels
+        as a ``connector`` in the session kwargs and no ``proxy`` request
+        kwarg.
+        """
         from tools.send_message_tool import _resolve_slack_user_target
 
         calls = []
@@ -379,29 +376,51 @@ class TestSlackDmProxyBypass:
             monkeypatch.delenv(key, raising=False)
         for key, value in env.items():
             monkeypatch.setenv(key, value)
-        resolved, error = asyncio.run(
-            _resolve_slack_user_target("xoxb", "user:U1", base_url=self.BASE)
-        )
+        seen = []
+        with patch(
+            "gateway.platforms.base.proxy_kwargs_for_aiohttp",
+            side_effect=lambda url: (seen.append(url), ({}, {}))[1],
+        ):
+            resolved, error = asyncio.run(
+                _resolve_slack_user_target("xoxb", "user:U1", base_url=self.BASE)
+            )
         assert error is None, error
         assert resolved == "D1"
         assert calls and calls[0][0] == self.BASE + "conversations.open"
-        return calls[0][1]
+        assert len(seen) == 1
+        return seen[0]
 
     def test_no_proxy_on_the_custom_host_keeps_the_request_direct(
         self, monkeypatch
     ):
-        kwargs = self._resolve(
-            monkeypatch,
-            {
-                "HTTPS_PROXY": "http://proxy:3128",
-                "NO_PROXY": "slack.internal.corp",
-            },
+        assert (
+            self._resolve(
+                monkeypatch,
+                {
+                    "HTTPS_PROXY": "http://proxy:3128",
+                    "NO_PROXY": "slack.internal.corp",
+                },
+            )
+            is None
         )
-        assert "proxy" not in kwargs
 
     def test_proxy_still_applies_without_a_matching_no_proxy(self, monkeypatch):
-        kwargs = self._resolve(monkeypatch, {"HTTPS_PROXY": "http://proxy:3128"})
-        assert kwargs.get("proxy") == "http://proxy:3128"
+        assert (
+            self._resolve(monkeypatch, {"HTTPS_PROXY": "http://proxy:3128"})
+            == "http://proxy:3128"
+        )
+
+    def test_no_proxy_on_slack_com_does_not_bypass_a_custom_endpoint(
+        self, monkeypatch
+    ):
+        """Only the endpoint being called counts, not Slack's own hosts."""
+        assert (
+            self._resolve(
+                monkeypatch,
+                {"HTTPS_PROXY": "http://proxy:3128", "NO_PROXY": "slack.com"},
+            )
+            == "http://proxy:3128"
+        )
 
 
 class TestSendMessageTool:

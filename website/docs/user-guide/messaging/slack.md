@@ -520,16 +520,17 @@ To send Slack **directly**, bypassing the proxy, add a Slack host to `NO_PROXY`:
 NO_PROXY=slack.com
 ```
 
-`NO_PROXY=slack.com` covers `slack.com`, `files.slack.com`, and
-`wss-primary.slack.com`. When you set a custom `base_url`, **its host is honored in
-`NO_PROXY` too** — so `NO_PROXY=slack.internal.corp` disables the proxy for your
-custom endpoint. As soon as a matching host appears in `NO_PROXY`, Slack traffic
-goes direct.
-
-The equivalent environment variable is `SLACK_ALLOW_BOTS=none|mentions|all`.
-When both are set, `platforms.slack.extra.allow_bots` takes precedence. Avoid
-`all` when peer bots can answer each other without an explicit mention, because
-their own reply policies can still create loops.
+`NO_PROXY` entries match subdomains, so `NO_PROXY=slack.com` covers
+`files.slack.com` and `wss-primary.slack.com` as well. When you set a custom
+`base_url`, **its host is honored in `NO_PROXY` too** — so
+`NO_PROXY=slack.internal.corp` disables the proxy for your custom endpoint.
+The in-process bot keeps a Socket Mode connection alongside the Web API, so any
+of those hosts in `NO_PROXY` sends its traffic direct. Out-of-process delivery
+(cron, `send_message`) talks to the Web API endpoint only and is matched against
+that endpoint's host alone — `NO_PROXY=slack.com` does not send it direct once
+`base_url` points somewhere else. Attachment uploads inherit that decision and
+then post the bytes to the upload URL the endpoint hands out (`files.slack.com`
+unless it rewrites them).
 
 ### Working-State Status Line
 

@@ -18,7 +18,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Callable, ClassVar, Dict, Optional, Any, Tuple, List
+from typing import Callable, ClassVar, Dict, Optional, Any, Sequence, Tuple, List
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -939,11 +939,29 @@ def _slack_proxy_bypass_hosts(base_url: Optional[str] = None) -> Tuple[str, ...]
     return _SLACK_PROXY_HOSTS
 
 
-def _resolve_slack_proxy_url(base_url: Optional[str] = None) -> Optional[str]:
+def _slack_endpoint_bypass_hosts(base_url: Optional[str] = None) -> Tuple[str, ...]:
+    """Return the NO_PROXY hosts for a caller scoped to the Web API endpoint.
+
+    ``resolve_proxy_url`` bypasses the proxy as soon as *any* host it is given
+    matches NO_PROXY, so a caller whose traffic is anchored to the Web API
+    endpoint passes that host alone — otherwise ``NO_PROXY=files.slack.com``
+    would send a call to a custom endpoint direct. A default deployment is
+    unaffected: the endpoint host is ``slack.com``, and NO_PROXY entries match
+    subdomains. Clients that also open the Socket Mode connection use
+    ``_slack_proxy_bypass_hosts`` instead.
+    """
+    host = _slack_base_url_host(base_url) or _slack_base_url_host(
+        _DEFAULT_SLACK_BASE_URL
+    )
+    return (host,) if host else ()
+
+
+def _resolve_slack_proxy_url(bypass_hosts: Sequence[str]) -> Optional[str]:
     """Resolve a proxy URL that Slack SDK clients can safely use.
 
-    When ``base_url`` points at a custom Slack endpoint, its host participates
-    in the NO_PROXY bypass check alongside the built-in Slack hosts.
+    ``bypass_hosts`` are the hosts checked against NO_PROXY: a client that
+    also opens Socket Mode passes ``_slack_proxy_bypass_hosts``, one anchored
+    to the Web API endpoint passes ``_slack_endpoint_bypass_hosts``.
     """
     proxy_url = resolve_proxy_url()
     if not proxy_url:
@@ -957,10 +975,7 @@ def _resolve_slack_proxy_url(base_url: Optional[str] = None) -> Optional[str]:
         )
         return None
 
-    if any(
-        is_host_excluded_by_no_proxy(host)
-        for host in _slack_proxy_bypass_hosts(base_url)
-    ):
+    if any(is_host_excluded_by_no_proxy(host) for host in bypass_hosts):
         logger.info("[Slack] NO_PROXY bypasses Slack proxy configuration")
         return None
 
@@ -2057,7 +2072,7 @@ class SlackAdapter(BasePlatformAdapter):
                 safe_url_for_log(base_url),
             )
 
-        proxy_url = _resolve_slack_proxy_url(base_url)
+        proxy_url = _resolve_slack_proxy_url(_slack_proxy_bypass_hosts(base_url))
         if proxy_url:
             logger.info(
                 "[Slack] Using proxy for Slack transport: %s",
@@ -8746,7 +8761,8 @@ class SlackAdapter(BasePlatformAdapter):
 
 
 # Cache for Slack user ID -> DM conversation ID resolution in the standalone
-# send path.  Keyed by "{token}:{user_id}" to support multi-workspace setups.
+# send path.  Keyed by "{base_url}|{token}:{user_id}" to support multi-workspace
+# setups and Slack-compatible endpoints with their own conversation IDs.
 _slack_dm_cache: Dict[str, str] = {}
 _SLACK_DM_CACHE_MAX = 5000
 
@@ -8769,9 +8785,9 @@ async def _resolve_slack_user_dm(
     hands out its own conversation IDs.  Returns None if resolution fails
     (missing ``im:write`` scope, unknown user, etc.).
 
-    ``base_url`` must already be normalized (trailing slash) — see
-    ``_normalize_slack_base_url``. ``None`` means the real Slack endpoint.
+    ``None`` for ``base_url`` means the real Slack endpoint.
     """
+    base_url = _normalize_slack_base_url(base_url)
     cache_key = f"{base_url or _DEFAULT_SLACK_BASE_URL}|{token}:{user_id}"
     if cache_key in _slack_dm_cache:
         return _slack_dm_cache[cache_key]
@@ -8783,10 +8799,11 @@ async def _resolve_slack_user_dm(
     try:
         from gateway.platforms.base import proxy_kwargs_for_aiohttp
 
-        # NO_PROXY-aware for the built-in Slack hosts and any custom base_url
-        # host — a self-hosted endpoint is typically the reason a proxy must
-        # be bypassed in the first place.
-        _proxy = _resolve_slack_proxy_url(base_url)
+        # NO_PROXY-aware for the endpoint this call targets, same as the DM
+        # leg in tools/send_message_tool.py. Not _resolve_slack_proxy_url:
+        # that one drops non-http(s) proxies for the Slack SDK, while aiohttp
+        # supports SOCKS.
+        _proxy = resolve_proxy_url(target_hosts=_slack_endpoint_bypass_hosts(base_url))
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
         url = (base_url or _DEFAULT_SLACK_BASE_URL) + "conversations.open"
         headers = {
@@ -8913,8 +8930,7 @@ async def _standalone_send(
     token = tokens[0]
 
     # base_url from PlatformConfig.extra (config.yaml), matching the in-process
-    # adapter. Resolved once here so every leg of this send — DM resolution,
-    # the media client, the text post — talks to the same endpoint.
+    # adapter. Resolved once so every leg below talks to the same endpoint.
     _extra = getattr(pconfig, "extra", None) or {}
     _base_url = _normalize_slack_base_url(_extra.get("base_url"))
 
@@ -8976,7 +8992,13 @@ async def _standalone_send(
 
         client = _AsyncWebClient(token=token)
         _apply_slack_base_url(client, _base_url)
-        _apply_slack_proxy(client, _resolve_slack_proxy_url(_base_url))
+        # One proxy decision per client, taken against the endpoint host —
+        # same rule as the text-only leg below. files_upload_v2 then posts the
+        # bytes to whatever upload URL the endpoint hands out (files.slack.com
+        # unless it rewrites them), reusing that decision.
+        _apply_slack_proxy(
+            client, _resolve_slack_proxy_url(_slack_endpoint_bypass_hosts(_base_url))
+        )
         last_message_id = None
 
         # Caption mode: skip a separate text post; comment rides the upload.
@@ -9084,8 +9106,8 @@ async def _standalone_send(
     try:
         from gateway.platforms.base import proxy_kwargs_for_aiohttp
 
-        # NO_PROXY-aware for the built-in Slack hosts and any custom base_url host.
-        _proxy = resolve_proxy_url(target_hosts=_slack_proxy_bypass_hosts(_base_url))
+        # NO_PROXY-aware for the endpoint this call targets.
+        _proxy = resolve_proxy_url(target_hosts=_slack_endpoint_bypass_hosts(_base_url))
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
         url = (_base_url or _DEFAULT_SLACK_BASE_URL) + "chat.postMessage"
         # Errors that mean "wrong workspace token for this channel" — worth
