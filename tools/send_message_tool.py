@@ -1666,9 +1666,14 @@ async def _resolve_slack_user_target(token, chat_id, *, base_url=None):
         return None, {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
-        _proxy = resolve_proxy_url()
-        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        from urllib.parse import urlsplit
         api_base = _slack_dm_base_url({"base_url": base_url} if base_url else None)
+        # resolve_proxy_url only consults NO_PROXY for the hosts it is told
+        # about, and every request below goes to api_base and nowhere else —
+        # the rule the Slack adapter's DM leg applies as well.
+        _api_host = (urlsplit(api_base).hostname or "").strip().lower()
+        _proxy = resolve_proxy_url(target_hosts=[_api_host] if _api_host else None)
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
         async def post_api(session, method, payload):

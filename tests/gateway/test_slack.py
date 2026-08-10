@@ -108,6 +108,49 @@ def _rich_text_section(*elements):
     return {"type": "rich_text_section", "elements": list(elements)}
 
 
+def _mock_resp(payload):
+    """An aiohttp response context manager that answers with ``payload``."""
+    resp = MagicMock()
+    resp.status = 200
+    resp.json = AsyncMock(return_value=payload)
+    resp.__aenter__ = AsyncMock(return_value=resp)
+    resp.__aexit__ = AsyncMock(return_value=None)
+    return resp
+
+
+def _mock_session(*responses):
+    """An aiohttp session whose posts answer ``responses`` in order."""
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    session.post = MagicMock(side_effect=list(responses))
+    return session
+
+
+@contextlib.contextmanager
+def _captured_proxy_urls():
+    """Collect the proxy URLs handed to ``proxy_kwargs_for_aiohttp``.
+
+    That URL is the proxy decision itself; the kwargs it returns are
+    transport detail — with aiohttp-socks installed every scheme travels as
+    a ``connector`` in the session kwargs and no ``proxy`` request kwarg.
+    """
+    seen = []
+    with patch(
+        "gateway.platforms.base.proxy_kwargs_for_aiohttp",
+        side_effect=lambda url: (seen.append(url), ({}, {}))[1],
+    ):
+        yield seen
+
+
+@pytest.fixture(autouse=True)
+def _isolate_dm_cache():
+    """The DM cache is module state shared by every test in the file."""
+    _slack_mod._slack_dm_cache.clear()
+    yield
+    _slack_mod._slack_dm_cache.clear()
+
+
 def test_slack_mock_bootstrap_preserves_installed_packages():
     """Installed Slack dependencies must remain importable as real packages."""
     for package in ("slack_sdk", "aiohttp"):
@@ -852,7 +895,12 @@ class TestSlackProxyBehavior:
                 side_effect=lambda host: host == "wss-primary.slack.com",
             ) as excluded,
         ):
-            assert _slack_mod._resolve_slack_proxy_url() is None
+            assert (
+                _slack_mod._resolve_slack_proxy_url(
+                    _slack_mod._slack_proxy_bypass_hosts()
+                )
+                is None
+            )
             excluded.assert_has_calls(
                 [
                     call("slack.com"),
@@ -1069,28 +1117,10 @@ class TestStandaloneSendUserDmResolution:
     bypasses send_message()'s tool-level resolution, so the standalone
     sender must resolve on its own."""
 
-    @staticmethod
-    def _mock_resp(payload):
-        resp = MagicMock()
-        resp.status = 200
-        resp.json = AsyncMock(return_value=payload)
-        resp.__aenter__ = AsyncMock(return_value=resp)
-        resp.__aexit__ = AsyncMock(return_value=None)
-        return resp
-
-    def _mock_session(self, *responses):
-        session = MagicMock()
-        session.__aenter__ = AsyncMock(return_value=session)
-        session.__aexit__ = AsyncMock(return_value=None)
-        session.post = MagicMock(side_effect=list(responses))
-        return session
-
-
     @pytest.mark.asyncio
     async def test_channel_id_skips_resolution(self):
-        _slack_mod._slack_dm_cache.clear()
-        post_resp = self._mock_resp({"ok": True, "ts": "123.456"})
-        session = self._mock_session(post_resp)
+        post_resp = _mock_resp({"ok": True, "ts": "123.456"})
+        session = _mock_session(post_resp)
         config = PlatformConfig(enabled=True, token="xoxb-fake-token")
 
         with patch.object(_slack_mod.aiohttp, "ClientSession", return_value=session):
@@ -1104,11 +1134,10 @@ class TestStandaloneSendUserDmResolution:
     @pytest.mark.asyncio
     async def test_user_id_media_delivery_resolves_dm_before_upload(self, tmp_path):
         """Media path composes with DM resolution: files_upload_v2 gets D…"""
-        _slack_mod._slack_dm_cache.clear()
         image = tmp_path / "report.png"
         image.write_bytes(b"\x89PNG\r\n\x1a\n")
-        open_resp = self._mock_resp({"ok": True, "channel": {"id": "D777666555"}})
-        session = self._mock_session(open_resp)
+        open_resp = _mock_resp({"ok": True, "channel": {"id": "D777666555"}})
+        session = _mock_session(open_resp)
         client = MagicMock()
         client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "1.0"})
         client.files_upload_v2 = AsyncMock(return_value={"ok": True, "ts": "9.9"})
@@ -1131,7 +1160,6 @@ class TestStandaloneSendUserDmResolution:
         assert result["chat_id"] == "D777666555"
         client.files_upload_v2.assert_awaited_once()
         assert client.files_upload_v2.await_args.kwargs["channel"] == "D777666555"
-        _slack_mod._slack_dm_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1182,6 +1210,15 @@ class TestSlackBaseUrl:
             == _slack_mod._SLACK_PROXY_HOSTS
         )
 
+    def test_slack_endpoint_bypass_hosts_is_the_endpoint_alone(self):
+        """A caller anchored to the Web API endpoint checks that host and
+        nothing else, so an unrelated Slack host in NO_PROXY cannot bypass."""
+        assert _slack_mod._slack_endpoint_bypass_hosts() == ("slack.com",)
+        assert _slack_mod._slack_endpoint_bypass_hosts(None) == ("slack.com",)
+        assert _slack_mod._slack_endpoint_bypass_hosts(
+            "https://slack.internal.corp/api/"
+        ) == ("slack.internal.corp",)
+
     def test_apply_slack_base_url_sets_client_base_url(self):
         class _Client:
             base_url = "https://slack.com/api/"
@@ -1207,7 +1244,11 @@ class TestSlackBaseUrl:
             ) as excluded,
         ):
             assert (
-                _slack_mod._resolve_slack_proxy_url("https://slack.internal.corp/api/")
+                _slack_mod._resolve_slack_proxy_url(
+                    _slack_mod._slack_proxy_bypass_hosts(
+                        "https://slack.internal.corp/api/"
+                    )
+                )
                 is None
             )
             excluded.assert_any_call("slack.internal.corp")
@@ -1224,7 +1265,11 @@ class TestSlackBaseUrl:
             ),
         ):
             assert (
-                _slack_mod._resolve_slack_proxy_url("https://slack.internal.corp/api/")
+                _slack_mod._resolve_slack_proxy_url(
+                    _slack_mod._slack_proxy_bypass_hosts(
+                        "https://slack.internal.corp/api/"
+                    )
+                )
                 == "http://proxy.example.com:3128"
             )
 
@@ -1411,6 +1456,254 @@ class TestSlackBaseUrl:
         assert len(session.calls) == 1
         url, _kwargs = session.calls[0]
         assert url == "https://slack.internal.corp/api/chat.postMessage"
+
+
+# ---------------------------------------------------------------------------
+# TestSlackBaseUrlDeliveryLegs
+# ---------------------------------------------------------------------------
+
+
+class TestSlackBaseUrlDeliveryLegs:
+    """Every leg of a standalone send must honor the custom endpoint.
+
+    DM resolution and the media upload are separate clients from the text
+    post, so each one can leak to the real Slack on its own.
+    """
+
+    BASE = "https://slack.internal.corp/api"
+    NORMALIZED = "https://slack.internal.corp/api/"
+
+    @staticmethod
+    def _proxy_env(monkeypatch, **env):
+        """Pin the proxy env so the host's own settings cannot leak in."""
+        for key in (
+            "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+            "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+
+    def _config(self):
+        return PlatformConfig(
+            enabled=True, token="xoxb-tok", extra={"base_url": self.BASE}
+        )
+
+    @pytest.mark.asyncio
+    async def test_user_dm_resolution_hits_the_custom_endpoint(self):
+        session = _mock_session(
+            _mock_resp({"ok": True, "channel": {"id": "D999"}}),
+            _mock_resp({"ok": True, "ts": "1.1"}),
+        )
+        with (
+            patch.object(_slack_mod.aiohttp, "ClientSession", return_value=session),
+            patch.object(_slack_mod, "resolve_proxy_url", return_value=None),
+        ):
+            result = await _slack_mod._standalone_send(
+                self._config(), "U1234567890", "hello"
+            )
+
+        assert result["success"] is True
+        assert result["chat_id"] == "D999"
+        assert (
+            session.post.call_args_list[0].args[0]
+            == self.NORMALIZED + "conversations.open"
+        )
+        assert (
+            session.post.call_args_list[1].args[0]
+            == self.NORMALIZED + "chat.postMessage"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dm_cache_is_scoped_to_the_endpoint(self):
+        """Two endpoints hand out their own conversation IDs for one user."""
+        custom = _mock_session(_mock_resp({"ok": True, "channel": {"id": "D_CUSTOM"}}))
+        with (
+            patch.object(_slack_mod.aiohttp, "ClientSession", return_value=custom),
+            patch.object(_slack_mod, "resolve_proxy_url", return_value=None),
+        ):
+            assert (
+                await _slack_mod._resolve_slack_user_dm("tok", "U1", self.NORMALIZED)
+                == "D_CUSTOM"
+            )
+
+        default = _mock_session(_mock_resp({"ok": True, "channel": {"id": "D_SLACK"}}))
+        with (
+            patch.object(_slack_mod.aiohttp, "ClientSession", return_value=default),
+            patch.object(_slack_mod, "resolve_proxy_url", return_value=None),
+        ):
+            assert await _slack_mod._resolve_slack_user_dm("tok", "U1") == "D_SLACK"
+
+    @pytest.mark.asyncio
+    async def test_dm_resolution_normalizes_the_endpoint(self):
+        """An endpoint without a trailing slash still builds a valid URL and
+        shares the cache entry with its normalized form."""
+        session = _mock_session(_mock_resp({"ok": True, "channel": {"id": "D999"}}))
+        with (
+            patch.object(_slack_mod.aiohttp, "ClientSession", return_value=session),
+            patch.object(_slack_mod, "resolve_proxy_url", return_value=None),
+        ):
+            assert (
+                await _slack_mod._resolve_slack_user_dm("tok", "U1", self.BASE)
+                == "D999"
+            )
+            assert (
+                await _slack_mod._resolve_slack_user_dm("tok", "U1", self.NORMALIZED)
+                == "D999"
+            )
+
+        assert (
+            session.post.call_args_list[0].args[0]
+            == self.NORMALIZED + "conversations.open"
+        )
+        assert session.post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_user_dm_resolution_honors_no_proxy_for_the_custom_host(
+        self, monkeypatch
+    ):
+        """NO_PROXY on the private host must keep conversations.open direct."""
+        session = _mock_session(
+            _mock_resp({"ok": True, "channel": {"id": "D999"}})
+        )
+        self._proxy_env(
+            monkeypatch,
+            HTTPS_PROXY="http://proxy:3128",
+            NO_PROXY="slack.internal.corp",
+        )
+        with (
+            patch.object(_slack_mod.aiohttp, "ClientSession", return_value=session),
+            _captured_proxy_urls() as seen,
+        ):
+            assert (
+                await _slack_mod._resolve_slack_user_dm("tok", "U1", self.NORMALIZED)
+                == "D999"
+            )
+        assert seen == [None]
+
+    @pytest.mark.asyncio
+    async def test_user_dm_resolution_uses_the_proxy_when_not_bypassed(
+        self, monkeypatch
+    ):
+        """Control for the case above: without NO_PROXY the proxy still applies."""
+        session = _mock_session(
+            _mock_resp({"ok": True, "channel": {"id": "D999"}})
+        )
+        self._proxy_env(monkeypatch, HTTPS_PROXY="http://proxy:3128")
+        with (
+            patch.object(_slack_mod.aiohttp, "ClientSession", return_value=session),
+            _captured_proxy_urls() as seen,
+        ):
+            await _slack_mod._resolve_slack_user_dm("tok", "U1", self.NORMALIZED)
+        assert seen == ["http://proxy:3128"]
+
+    @pytest.mark.asyncio
+    async def test_no_proxy_on_slack_com_does_not_bypass_a_custom_endpoint(
+        self, monkeypatch
+    ):
+        """NO_PROXY is matched against the endpoint the call targets, and
+        nothing else — the same rule the send_message_tool DM leg applies."""
+        session = _mock_session(
+            _mock_resp({"ok": True, "channel": {"id": "D999"}})
+        )
+        self._proxy_env(
+            monkeypatch, HTTPS_PROXY="http://proxy:3128", NO_PROXY="slack.com"
+        )
+        with (
+            patch.object(_slack_mod.aiohttp, "ClientSession", return_value=session),
+            _captured_proxy_urls() as seen,
+        ):
+            await _slack_mod._resolve_slack_user_dm("tok", "U1", self.NORMALIZED)
+        assert seen == ["http://proxy:3128"]
+
+    @pytest.mark.asyncio
+    async def test_user_dm_resolution_keeps_a_socks_proxy(self, monkeypatch):
+        """aiohttp handles SOCKS; only the Slack SDK legs are http(s)-only."""
+        session = _mock_session(
+            _mock_resp({"ok": True, "channel": {"id": "D999"}})
+        )
+        self._proxy_env(monkeypatch, ALL_PROXY="socks5://127.0.0.1:1080")
+        with (
+            patch.object(_slack_mod.aiohttp, "ClientSession", return_value=session),
+            _captured_proxy_urls() as seen,
+        ):
+            await _slack_mod._resolve_slack_user_dm("tok", "U1", self.NORMALIZED)
+        assert seen == ["socks5://127.0.0.1:1080"]
+
+    @pytest.mark.asyncio
+    async def test_media_client_targets_the_custom_endpoint(self, tmp_path):
+        image = tmp_path / "report.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        client = MagicMock()
+        client.base_url = "https://slack.com/api/"
+        client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "1.0"})
+        client.files_upload_v2 = AsyncMock(return_value={"ok": True, "ts": "9.9"})
+
+        with (
+            _fake_slack_sdk_modules(client),
+            patch.object(_slack_mod, "resolve_proxy_url", return_value=None),
+        ):
+            result = await _slack_mod._standalone_send(
+                self._config(),
+                "C123",
+                "daily report",
+                media_files=[(str(image), False)],
+            )
+
+        assert result["success"] is True
+        assert client.base_url == self.NORMALIZED
+
+    @pytest.mark.asyncio
+    async def test_media_client_honors_no_proxy_for_the_custom_host(self, tmp_path):
+        image = tmp_path / "report.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        client = MagicMock()
+        client.files_upload_v2 = AsyncMock(return_value={"ok": True, "ts": "9.9"})
+
+        with (
+            _fake_slack_sdk_modules(client),
+            patch.object(
+                _slack_mod, "resolve_proxy_url", return_value="http://proxy:3128"
+            ),
+            patch.object(
+                _slack_mod,
+                "is_host_excluded_by_no_proxy",
+                side_effect=lambda host: host == "slack.internal.corp",
+            ),
+            patch.object(_slack_mod, "_apply_slack_proxy") as apply_proxy,
+        ):
+            result = await _slack_mod._standalone_send(
+                self._config(), "C123", "", media_files=[(str(image), False)]
+            )
+
+        assert result["success"] is True
+        apply_proxy.assert_called_once_with(client, None)
+
+    @pytest.mark.asyncio
+    async def test_no_proxy_on_another_slack_host_does_not_bypass_media(
+        self, monkeypatch, tmp_path
+    ):
+        """The upload client's proxy decision belongs to the Web API
+        endpoint, so an unrelated Slack host in NO_PROXY must not send it
+        direct."""
+        image = tmp_path / "report.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        client = MagicMock()
+        client.files_upload_v2 = AsyncMock(return_value={"ok": True, "ts": "9.9"})
+
+        self._proxy_env(
+            monkeypatch, HTTPS_PROXY="http://proxy:3128", NO_PROXY="files.slack.com"
+        )
+        with (
+            _fake_slack_sdk_modules(client),
+            patch.object(_slack_mod, "_apply_slack_proxy") as apply_proxy,
+        ):
+            result = await _slack_mod._standalone_send(
+                self._config(), "C123", "", media_files=[(str(image), False)]
+            )
+
+        assert result["success"] is True
+        apply_proxy.assert_called_once_with(client, "http://proxy:3128")
 
 
 # ---------------------------------------------------------------------------
