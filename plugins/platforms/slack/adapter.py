@@ -519,6 +519,12 @@ def _extract_text_from_slack_attachments(attachments: list) -> str:
     for att in attachments:
         if not isinstance(att, dict):
             continue
+        # Slack permalink unfurls (``is_msg_unfurl``) carry the *linked*
+        # message's own body. The live inbound path already skips them; doing
+        # the same here keeps thread/parent hydration from appending a second
+        # copy of a message the agent is already reading.
+        if att.get("is_msg_unfurl"):
+            continue
         got: list[str] = [
             str(att[key]) for key in ("pretext", "title", "text") if att.get(key)
         ]
@@ -547,6 +553,21 @@ _SLACK_FENCED_CODE_RE = re.compile(
 )
 _SLACK_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _SLACK_INLINE_STYLE_RE = re.compile(r"([*_~])([^\n]+?)\1")
+_SLACK_HTML_ENTITY_RE = re.compile(r"&(amp|lt|gt);")
+_SLACK_HTML_ENTITIES = {"amp": "&", "lt": "<", "gt": ">"}
+
+
+def _unescape_slack_entities(text: str) -> str:
+    """Undo Slack's HTML escaping of ``&``/``<``/``>`` in flat message text.
+
+    Slack escapes those three characters in the flat ``text`` field but leaves
+    the ``blocks`` payload raw, so any comparison between the two must run on
+    a common form. Thread permalinks make this load-bearing: every "Copy link"
+    URL carries ``?thread_ts=…&cid=…``.
+    """
+    return _SLACK_HTML_ENTITY_RE.sub(
+        lambda match: _SLACK_HTML_ENTITIES[match.group(1)], text or ""
+    )
 
 
 def _normalize_slack_text_for_dedupe(text: str, bot_uid: str = "") -> str:
@@ -559,6 +580,10 @@ def _normalize_slack_text_for_dedupe(text: str, bot_uid: str = "") -> str:
     canonical = text or ""
     if bot_uid:
         canonical = canonical.replace(f"<@{bot_uid}>", "")
+    # Unescape BEFORE link canonicalization so both sides of the comparison
+    # see the same angle-bracket forms; otherwise a link with query
+    # parameters reads as new content and gets appended a second time.
+    canonical = _unescape_slack_entities(canonical)
     canonical = _SLACK_MRKDWN_LINK_RE.sub(_link, canonical)
     canonical = _SLACK_FENCED_CODE_RE.sub(r"\1", canonical)
     canonical = _SLACK_INLINE_CODE_RE.sub(r"\1", canonical)
@@ -603,11 +628,21 @@ def _extract_additional_text_from_slack_blocks(
 
 
 def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> str:
-    """Return a compact, redacted JSON view of the current message's Block Kit payload."""
-    if not blocks:
-        return ""
+    """Return a compact, redacted JSON view of the current message's Block Kit payload.
 
-    if all((block or {}).get("type") == "rich_text" for block in blocks):
+    Only blocks the agent cannot already read are serialized. ``rich_text``
+    blocks are the authored message itself and are rendered into the message
+    text by :func:`_extract_text_from_slack_blocks`; dumping them here would
+    repeat the author's own words — and, because the allowlist below drops
+    ``url``, the repeat reads as the same sentence with every link silently
+    removed. This view exists for the UI-heavy blocks bots post (``section``,
+    ``actions``, ``accessory``, …), so a single such block must not drag the
+    authored text along with it.
+    """
+    inspectable = [
+        block for block in (blocks or []) if (block or {}).get("type") != "rich_text"
+    ]
+    if not inspectable:
         return ""
 
     scalar_allowlist = {
@@ -659,9 +694,9 @@ def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> st
         return repr(value)
 
     try:
-        payload = json.dumps(_sanitize(blocks), ensure_ascii=False, indent=2)
+        payload = json.dumps(_sanitize(inspectable), ensure_ascii=False, indent=2)
     except Exception:
-        payload = repr(blocks)
+        payload = repr(inspectable)
 
     if len(payload) > max_chars:
         payload = payload[: max_chars - 18].rstrip() + "\n... [truncated]"
@@ -7437,7 +7472,15 @@ class SlackAdapter(BasePlatformAdapter):
             extras.append(attachments_text)
         if blocks:
             urls = _extract_urls_from_slack_blocks(blocks)
-            new_urls = [u for u in urls if u not in msg_text and all(u not in e for e in extras)]
+            # ``msg.text`` escapes ``&`` inside URLs while the block payload
+            # keeps it raw, so a plain substring check re-lists a URL the
+            # message already shows.
+            msg_text_raw = _unescape_slack_entities(msg_text)
+            new_urls = [
+                u
+                for u in urls
+                if u not in msg_text_raw and all(u not in e for e in extras)
+            ]
             if new_urls:
                 extras.append("URLs: " + ", ".join(new_urls))
         # Surface file/image attachments as compact text markers. The
