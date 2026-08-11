@@ -403,6 +403,68 @@ def _rewrite_known_bang_command(text: str) -> str:
     return text
 
 
+def _slack_permalink_path(channel_id: str | None, message_ts: str | None) -> str:
+    """The workspace-independent tail of a Slack message permalink.
+
+    A permalink is ``https://<workspace>.slack.com/archives/<channel>/p<ts>``;
+    only the tail can be rebuilt from a payload, so both sides of a dedupe
+    comparison are reduced to it.
+    """
+    if not channel_id or not message_ts:
+        return ""
+    return f"archives/{channel_id}/p{str(message_ts).replace('.', '')}"
+
+
+def _slack_str_field(el: dict, name: str) -> str:
+    """Read a string field of a Block Kit element.
+
+    Block Kit carries text as an object in many places, and a non-string would
+    raise in ``str.join`` below and cost the whole message.
+    """
+    value = el.get(name)
+    return value if isinstance(value, str) else ""
+
+
+def _render_slack_inline_element(el: dict) -> str:
+    """Render one Block Kit inline element, empty when it carries nothing.
+
+    Slack adds inline types without notice, so unknown ones fall back to
+    whatever human-readable field they carry rather than rendering as nothing.
+    """
+    el_type = el.get("type", "")
+    if el_type == "text":
+        return _slack_str_field(el, "text")
+    if el_type == "channel":
+        return f"<#{el.get('channel_id', '')}>"
+    if el_type == "user":
+        return f"<@{el.get('user_id', '')}>"
+    if el_type == "usergroup":
+        return f"<!subteam^{el.get('usergroup_id', '')}>"
+    if el_type == "team":
+        return f"<!team^{el.get('team_id', '')}>"
+    if el_type == "emoji":
+        return f":{el.get('name', '')}:"
+    if el_type == "broadcast":
+        return f"<!{el.get('range', 'here')}>"
+    if el_type == "color":
+        return _slack_str_field(el, "value")
+    if el_type == "date":
+        fallback = _slack_str_field(el, "fallback")
+        if fallback:
+            return fallback
+    # ``link``, ``message_mention``, a ``date`` without a ``fallback`` and any
+    # unknown type: a URL plus an optional label.
+    url = _slack_str_field(el, "url")
+    label = _slack_str_field(el, "text") or _slack_str_field(el, "fallback")
+    if not url and el_type == "message_mention":
+        # ``url`` is optional here; ``channel_id`` and ``message_ts`` are not,
+        # and they are the permalink's own components.
+        url = _slack_permalink_path(el.get("channel_id"), el.get("message_ts"))
+    if url:
+        return f"{label} ({url})" if label and label != url else url
+    return label
+
+
 def _extract_text_from_slack_blocks(blocks: list) -> str:
     """Extract readable text from Slack Block Kit blocks, including quoted/forwarded content.
 
@@ -422,28 +484,7 @@ def _extract_text_from_slack_blocks(blocks: list) -> str:
 
     def _render_inline_elements(elements: list) -> str:
         """Render inline elements (text, link, channel, user, emoji, etc.)."""
-        pieces: list[str] = []
-        for el in elements:
-            el_type = el.get("type", "")
-            if el_type == "text":
-                pieces.append(el.get("text", ""))
-            elif el_type == "link":
-                url = el.get("url", "")
-                text = el.get("text", "")
-                pieces.append(f"{text} ({url})" if text and text != url else url)
-            elif el_type == "channel":
-                pieces.append(f"<#{el.get('channel_id', '')}>")
-            elif el_type == "user":
-                pieces.append(f"<@{el.get('user_id', '')}>")
-            elif el_type == "usergroup":
-                pieces.append(f"<!subteam^{el.get('usergroup_id', '')}>")
-            elif el_type == "emoji":
-                pieces.append(f":{el.get('name', '')}:")
-            elif el_type == "broadcast":
-                pieces.append(f"<!{el.get('range', 'here')}>")
-            elif el_type == "date":
-                pieces.append(el.get("fallback", ""))
-        return "".join(pieces)
+        return "".join(_render_slack_inline_element(el) for el in elements)
 
     def _append_line(text: str, quote_depth: int = 0, bullet: str = "") -> None:
         if not text or not text.strip():
@@ -519,10 +560,8 @@ def _extract_text_from_slack_attachments(attachments: list) -> str:
     for att in attachments:
         if not isinstance(att, dict):
             continue
-        # Slack permalink unfurls (``is_msg_unfurl``) carry the *linked*
-        # message's own body. The live inbound path already skips them; doing
-        # the same here keeps thread/parent hydration from appending a second
-        # copy of a message the agent is already reading.
+        # A permalink unfurl carries the linked message's own body, which the
+        # agent is already reading. The live inbound path skips these too.
         if att.get("is_msg_unfurl"):
             continue
         got: list[str] = [
@@ -545,13 +584,26 @@ def _extract_text_from_slack_attachments(attachments: list) -> str:
     return "\n".join(line for line in lines if line).strip()
 
 
+#: Any ``<scheme:target|label>`` autolink; Slack is not limited to ``https``
+#: and ``mailto``.
 _SLACK_MRKDWN_LINK_RE = re.compile(
-    r"<((?:https?|mailto):[^>|]+)(?:\|([^>]+))?>"
+    r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^>|]+)(?:\|([^>]+))?>"
 )
+#: The optional label Slack may attach to a mention in the flat text, while
+#: the blocks carry the bare id: ``<@U…|name>``, ``<#C…|general>``,
+#: ``<!subteam^S…|@marketing>``, ``<!here|@here>``.
+_SLACK_ENTITY_LABEL_RE = re.compile(r"<([@#!][^>|]*)\|[^>]*>")
 _SLACK_FENCED_CODE_RE = re.compile(
     r"(?<!`)\n*```[ \t]*\n?(.*?)\n?[ \t]*```\n*(?!`)", re.DOTALL
 )
 _SLACK_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_SLACK_DATE_RE = re.compile(r"<!date\^([^>|]*)(?:\|([^>]*))?>")
+#: A message permalink, reduced to the tail :func:`_slack_permalink_path`
+#: rebuilds: the workspace host and the thread query differ between the flat
+#: text and a payload that carries only ``channel_id``/``message_ts``.
+_SLACK_PERMALINK_RE = re.compile(
+    r"https?://[^\s/]+/(archives/[A-Za-z0-9]+/p\d+)(?:\?[^\s)]*)?"
+)
 _SLACK_INLINE_STYLE_RE = re.compile(r"([*_~])([^\n]+?)\1")
 _SLACK_HTML_ENTITY_RE = re.compile(r"&(amp|lt|gt);")
 _SLACK_HTML_ENTITIES = {"amp": "&", "lt": "<", "gt": ">"}
@@ -577,14 +629,28 @@ def _normalize_slack_text_for_dedupe(text: str, bot_uid: str = "") -> str:
         url, label = match.group(1), match.group(2)
         return f"{label} ({url})" if label and label != url else url
 
+    def _date(match: re.Match) -> str:
+        # ``<!date^ts^format^url|fallback>``, read down to what the rich-text
+        # side renders: the fallback, or the URL when there is no fallback.
+        fallback = match.group(2)
+        if fallback:
+            return fallback
+        parts = match.group(1).split("^")
+        return parts[2] if len(parts) > 2 else ""
+
     canonical = text or ""
-    if bot_uid:
-        canonical = canonical.replace(f"<@{bot_uid}>", "")
-    # Unescape BEFORE link canonicalization so both sides of the comparison
-    # see the same angle-bracket forms; otherwise a link with query
-    # parameters reads as new content and gets appended a second time.
+    # Before link canonicalization, so both sides see the same angle brackets
+    # and the same ``&`` in query parameters.
     canonical = _unescape_slack_entities(canonical)
     canonical = _SLACK_MRKDWN_LINK_RE.sub(_link, canonical)
+    canonical = _SLACK_DATE_RE.sub(_date, canonical)
+    # After the link form, so that a pasted permalink is already a bare URL.
+    canonical = _SLACK_PERMALINK_RE.sub(r"\1", canonical)
+    # After the date form, which carries a label of its own.
+    canonical = _SLACK_ENTITY_LABEL_RE.sub(r"<\1>", canonical)
+    # After the label, so that ``<@U…|hermes>`` is stripped like ``<@U…>``.
+    if bot_uid:
+        canonical = canonical.replace(f"<@{bot_uid}>", "")
     canonical = _SLACK_FENCED_CODE_RE.sub(r"\1", canonical)
     canonical = _SLACK_INLINE_CODE_RE.sub(r"\1", canonical)
     while True:
@@ -610,13 +676,14 @@ def _extract_additional_text_from_slack_blocks(
         if (block or {}).get("type") != "rich_text":
             continue
         for element in block.get("elements", []):
+            element_type = element.get("type", "")
             rendered = _extract_text_from_slack_blocks(
                 [{"type": "rich_text", "elements": [element]}]
             ).strip()
             if not rendered:
                 continue
             normalized = _normalize_slack_text_for_dedupe(rendered, bot_uid)
-            if element.get("type") == "rich_text_preformatted":
+            if element_type == "rich_text_preformatted":
                 is_duplicate = normalized in primary_fenced
             else:
                 is_duplicate = normalized == primary or normalized in primary
