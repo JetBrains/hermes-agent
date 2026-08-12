@@ -18,7 +18,17 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Callable, ClassVar, Dict, Optional, Any, Sequence, Tuple, List
+from typing import (
+    Awaitable,
+    Callable,
+    ClassVar,
+    Dict,
+    Optional,
+    Any,
+    Sequence,
+    Tuple,
+    List,
+)
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -816,6 +826,41 @@ def _apply_slack_proxy(client: Any, proxy_url: Optional[str]) -> None:
     """Apply a resolved proxy to a Slack SDK client or clear it explicitly."""
     if hasattr(client, "proxy"):
         client.proxy = proxy_url
+
+
+def _slack_per_request_proxy_middleware(
+    proxy_url: Optional[str],
+) -> Callable[..., Awaitable[Any]]:
+    """Build the Bolt middleware that re-applies *proxy_url* to each request.
+
+    ``slack_bolt`` builds a fresh ``AsyncWebClient`` for every inbound request
+    and copies ``proxy=app.client.proxy`` into its constructor. ``slack_sdk``
+    reads a ``None``/blank ``proxy`` *argument* as "unspecified" and reloads
+    ``HTTP(S)_PROXY`` from the environment, so a resolved "go direct" decision
+    — a NO_PROXY bypass, or a proxy scheme the transport cannot use — survives
+    only until that client is built. ``aiohttp`` then treats the env proxy as
+    an explicit one and skips its own NO_PROXY check, which is why clearing
+    ``proxy`` on ``app.client`` alone is not enough (assigning the attribute
+    post-construction is the only way to say "no proxy" to ``slack_sdk``).
+
+    Only the request-scoped client is affected, and it is the client
+    authorization calls ``auth.test`` with — so the failure looks like a
+    healthy bot: Socket Mode connects, outbound sends work, and every inbound
+    event is rejected with "Failed to authorize with the given token".
+
+    Registered as ``AsyncApp(before_authorize=...)`` so it runs once the
+    request-scoped client exists and before that first call. ``base_url`` needs
+    no pinning: Bolt copies it off ``app.client`` per request, where
+    ``_apply_slack_base_url`` has already applied it.
+    """
+
+    async def pin_per_request_proxy(
+        client: Any, next_: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        _apply_slack_proxy(client, proxy_url)
+        return await next_()
+
+    return pin_per_request_proxy
 
 
 # Default Slack Web API base URL used by ``slack_sdk`` (AsyncWebClient.BASE_URL).
@@ -2283,7 +2328,11 @@ class SlackAdapter(BasePlatformAdapter):
                 token=primary_token,
                 user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
             )
-            self._app = AsyncApp(token=primary_token, client=primary_client)
+            self._app = AsyncApp(
+                token=primary_token,
+                client=primary_client,
+                before_authorize=_slack_per_request_proxy_middleware(proxy_url),
+            )
             _apply_slack_proxy(self._app.client, proxy_url)
             _apply_slack_base_url(self._app.client, base_url)
 
