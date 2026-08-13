@@ -5719,25 +5719,35 @@ class BasePlatformAdapter(ABC):
             # simultaneous messages. Queue them without interrupting the active run,
             # then process them immediately after the current task finishes.
             if event.message_type == MessageType.PHOTO:
-                logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
+                # INFO with the platform message id: this parks the message
+                # for the post-turn drain, which replays it as a full user
+                # turn.  Any duplicate-turn investigation needs to see which
+                # copy of a message took a slot here.
+                logger.info(
+                    "[%s] parking photo follow-up for session %s (no interrupt): message_id=%s",
+                    self.name, session_key, getattr(event, "message_id", None),
+                )
                 merge_pending_message_event(self._pending_messages, session_key, event)
                 return  # Don't interrupt now - will run after current task completes
 
             if self._is_queue_text_debounce_candidate(event):
-                logger.debug(
+                logger.info(
                     "[%s] New text message while session %s is active — "
-                    "debouncing follow-up (busy_text_mode=queue, window=%.2fs)",
+                    "debouncing follow-up (busy_text_mode=queue, window=%.2fs): "
+                    "message_id=%s",
                     self.name,
                     session_key,
                     self._busy_text_debounce_seconds,
+                    getattr(event, "message_id", None),
                 )
                 await self._queue_text_debounce(session_key, event)
             else:
-                logger.debug(
+                logger.info(
                     "[%s] New message while session %s is active — queuing follow-up "
-                    "(no interrupt, will cascade after current turn)",
+                    "(no interrupt, will cascade after current turn): message_id=%s",
                     self.name,
                     session_key,
+                    getattr(event, "message_id", None),
                 )
                 merge_pending_message_event(
                     self._pending_messages,

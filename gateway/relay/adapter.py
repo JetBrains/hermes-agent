@@ -335,6 +335,25 @@ class RelayAdapter(BasePlatformAdapter):
         if await self._consume_prompt_response(event):
             return
         await self._localize_inbound_media(event)
+        # One INFO line per relay event that reaches the gateway — the relay
+        # ingress had no logging at all, so traffic arriving this way was
+        # invisible in gateway.log and could not be told apart from a
+        # gateway-internal replay.  Mirrors the native adapters'
+        # "delivering event to gateway" anchor; two lines with the same
+        # message_id mean the connector delivered the message twice.
+        try:
+            logger.info(
+                "[relay] delivering event to gateway: message_id=%s chat=%s "
+                "user=%s thread=%s type=%s",
+                getattr(event, "message_id", None),
+                getattr(getattr(event, "source", None), "chat_id", None),
+                getattr(getattr(event, "source", None), "user_id", None),
+                getattr(getattr(event, "source", None), "thread_id", None),
+                getattr(getattr(event, "message_type", None), "value", None)
+                or getattr(event, "message_type", None),
+            )
+        except Exception:  # noqa: BLE001 - logging must never break ingress
+            pass
         await self.handle_message(event)
 
     def _relay_slack_extra(self) -> Dict[str, Any]:

@@ -3239,6 +3239,28 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        # Diagnostics: steer() used to accept text silently, which made two
+        # very different outcomes indistinguishable in the logs — text spliced
+        # into a live turn, versus text accepted after the turn already ended
+        # (never injected, and NOT queued either, because the gateway reads
+        # the True below as "delivered").  turn_active/turn_age tell them
+        # apart; `merging=True` means a second steer piled onto a first.
+        _turn_started_at = getattr(self, "_active_turn_started_at", None)
+        try:
+            logger.info(
+                "steer received: turn_active=%s turn_age=%s merging=%s len=%d '%s...'",
+                _turn_started_at is not None,
+                (
+                    f"{time.time() - _turn_started_at:.1f}s"
+                    if _turn_started_at
+                    else "-"
+                ),
+                bool(getattr(self, "_pending_steer", None)),
+                len(cleaned),
+                cleaned[:60],
+            )
+        except Exception:
+            pass
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.

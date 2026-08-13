@@ -8571,17 +8571,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
+            # Diagnostics: this method is the single funnel through which a
+            # follow-up takes a queue slot, and the drain later turns that
+            # slot into a full user turn.  Logging the platform message_id
+            # here is what makes "the same message was answered twice"
+            # provable from gateway.log alone — the queued copy is otherwise
+            # completely silent (debug-only) until it is already a turn.
+            logger.info(
+                "queued follow-up (merged into pending slot): session=%s "
+                "message_id=%s type=%s",
+                session_key,
+                getattr(event, "message_id", None),
+                getattr(getattr(event, "message_type", None), "value", None)
+                or getattr(event, "message_type", None),
+            )
             return
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
-                "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
+                "Dropping busy-mode follow-up for session %s — pending queue at cap (%d): "
+                "message_id=%s",
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
+                getattr(event, "message_id", None),
             )
             return
 
         self._enqueue_fifo(session_key, event, adapter)
+        logger.info(
+            "queued follow-up (FIFO): session=%s message_id=%s depth=%s",
+            session_key,
+            getattr(event, "message_id", None),
+            self._queue_depth(session_key, adapter=adapter),
+        )
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -8873,6 +8895,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # merge semantics for media.
         if not steered and not redirected:
             self._queue_or_replace_pending_event(session_key, event)
+
+        # One INFO line per busy follow-up, carrying the platform message id
+        # and what we did with it.  The busy path was otherwise completely
+        # silent (debug-only branches; steer() logs nothing when it accepts
+        # text; a suppressed busy-ack hides the user-visible bubble), so a
+        # duplicated turn could not be traced back to "the same message
+        # entered the gateway a second time" from gateway.log.
+        logger.info(
+            "busy follow-up: session=%s message_id=%s mode=%s steered=%s "
+            "redirected=%s text_len=%d",
+            session_key,
+            getattr(event, "message_id", None),
+            effective_mode,
+            steered,
+            redirected,
+            len(event.text or ""),
+        )
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -16154,9 +16193,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
         logger.info(
-            "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
+            "inbound message: platform=%s user=%s chat=%s message_id=%s msg=%r "
+            "reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
+            source.chat_id or "unknown", getattr(event, "message_id", None),
+            _msg_preview, _reply_id, _reply_txt,
         )
 
         # Get or create session
@@ -16189,6 +16230,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
+        # Turn-start marker: ties the platform message_id to the session key
+        # it starts a turn in.  "inbound message" above is logged before the
+        # session is resolved, and the busy/queue/drain lines are keyed by
+        # session — without this line the two halves cannot be joined, which
+        # is exactly what blocked the duplicate-turn investigation.
+        logger.info(
+            "starting turn: session=%s message_id=%s platform=%s",
+            session_key,
+            getattr(event, "message_id", None),
+            _platform_name,
+        )
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
@@ -25271,7 +25323,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _leftover_steer = result.get("pending_steer")
                 if _leftover_steer:
                     pending = _leftover_steer
-                    logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+                    # INFO: this path produces a user turn from RAW steer text
+                    # (no author prefix, no [New message] wrapper), so a turn
+                    # that appears here looks different in the transcript from
+                    # a normally-prepared one.  Naming it explicitly is what
+                    # lets a duplicate turn be attributed to the steer path
+                    # rather than to the queue drain.
+                    logger.info(
+                        "Delivering leftover /steer as next turn for session %s: "
+                        "len=%d '%s...'",
+                        session_key or "?",
+                        len(pending),
+                        pending[:40],
+                    )
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
@@ -25462,6 +25526,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                    # The queued follow-up is about to become a turn of its
+                    # own.  Pair this with the "queued follow-up" line logged
+                    # when it took the slot and with the "inbound message"
+                    # line of the turn that was running: the same message_id
+                    # appearing in both is the signature of one message being
+                    # answered twice.
+                    logger.info(
+                        "Draining queued follow-up for session %s as a new turn: "
+                        "message_id=%s text_len=%d",
+                        next_session_key or session_key or "?",
+                        getattr(pending_event, "message_id", None),
+                        len(next_message or ""),
+                    )
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
