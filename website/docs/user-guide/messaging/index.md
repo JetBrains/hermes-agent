@@ -251,6 +251,37 @@ Semantics are honest at-least-once:
 Disable with `gateway.delivery_ledger: false` in `config.yaml` (restores the
 old behavior: in-flight responses are lost on crash).
 
+### Tracing an Inbound Message
+
+Messaging platforms deliver **at-least-once**: Slack replays an unacknowledged
+Socket Mode envelope, emits both `message` and `app_mention` for one mention,
+and re-sends `message_changed` when a link unfurls; Telegram and Feishu
+redeliver updates. When the same message reaches the gateway twice, the second
+copy can become a second agent turn — the same question answered twice.
+
+Every step of an inbound message is logged at INFO in `~/.hermes/logs/gateway.log`,
+keyed by the platform `message_id`:
+
+| Line | Meaning |
+|------|---------|
+| `[Slack] delivering event to gateway: ts=… age=… ingress=…` | The event reached the gateway. `age` is how long ago the user sent it; `ingress` is how long the adapter took. Two lines with the same `ts` mean the platform delivered it twice. |
+| `[Slack] dropped duplicate event ts=… age=…` | The adapter's TTL cache suppressed a redelivery (healthy). |
+| `[Slack] dropped message_changed for already-delivered ts=…` | An edit/unfurl of a message the agent already answered was suppressed. |
+| `[relay] delivering event to gateway: message_id=…` | Same anchor for relay-fronted platforms. |
+| `inbound message: … message_id=…` / `starting turn: session=… message_id=…` | The message is starting a turn in that session. |
+| `busy follow-up: session=… message_id=… mode=… steered=…` | It arrived while the agent was busy, and what was done with it. |
+| `queued follow-up (FIFO / merged into pending slot): … message_id=…` | It took a queue slot and will run after the current turn. |
+| `Draining queued follow-up … as a new turn: message_id=…` | The queued copy is becoming its own turn. |
+| `steer received: turn_active=… turn_age=…` | The agent accepted steer text. `turn_active=False` means no turn was running to inject it into. |
+| `Turn ended with an undelivered /steer …` / `Delivering leftover /steer as next turn …` | Steer text that never got injected is being handed back and replayed as a user turn. |
+
+Reading it: the **same `message_id` appearing both in a `starting turn` line and
+in a `busy follow-up` / `Draining queued follow-up` line** is one message being
+answered twice. A single `delivering event to gateway` line followed by two
+turns means the duplicate was created inside Hermes; two `delivering` lines mean
+the platform sent it twice (and `type`/`subtype`/`age` show why the adapter's
+dedup key did not match).
+
 ### Reset Policies
 
 **By default sessions never auto-reset** — context lives until you `/reset`

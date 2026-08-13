@@ -90,6 +90,24 @@ _HERMES_SLACK_USER_AGENT_PREFIX = f"HermesAgent/{_HERMES_VERSION}"
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
 
 
+def _slack_event_age(ts: Any) -> str:
+    """Seconds between a Slack event's own ``ts`` and now, as a log field.
+
+    Slack ``ts`` values are unix seconds with microsecond precision, so this
+    is the end-to-end delivery lag: how long ago the user actually pressed
+    Enter. It is the single most useful field when reasoning about repeated
+    deliveries — Slack re-sends a Socket Mode envelope that is not acked
+    within a few seconds, and the envelope is acked only after our ingress
+    coroutine returns. An age of several seconds on a first delivery is the
+    fingerprint of an ack timeout; an age of a minute on a duplicate is a
+    replay.
+    """
+    try:
+        return f"{max(0.0, time.time() - float(str(ts).split(':')[0])):.1f}s"
+    except (TypeError, ValueError):
+        return "?"
+
+
 async def _read_error_text_limited(
     response: Any,
     *,
@@ -5707,6 +5725,14 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: dict, payload: Optional[dict] = None
     ) -> None:
         """Handle an incoming Slack message event."""
+        # Stopwatch for the ingress leg (Slack hands us the event → we hand
+        # it to the gateway). Socket Mode acks an envelope only after this
+        # coroutine returns, and Slack re-sends anything unacked after a few
+        # seconds — so a slow ingress (thread-parent fetch, users.info,
+        # thread-context hydration, attachment downloads) is a direct cause
+        # of the same message entering the gateway twice. Reported on the
+        # "delivering event to gateway" line below.
+        _ingress_started = time.monotonic()
         # DEBUG entry log — fires BEFORE any filtering so users debugging
         # bot-to-bot interop, allow_bots config, or SLACK_ALLOWED_USERS
         # drops can confirm whether the event actually arrived from Slack
@@ -5739,6 +5765,18 @@ class SlackAdapter(BasePlatformAdapter):
                 original_message_ts
                 and original_message_ts in self._processed_message_ts
             ):
+                # INFO, not a silent return: this guard is the ONLY thing
+                # standing between an edit/unfurl re-emit and a second turn
+                # for a message the agent already answered (the dedup cache
+                # keys message_changed under a different id). If it ever
+                # misses, the absence of this line pins the moment.
+                logger.info(
+                    "[Slack] dropped message_changed for already-delivered "
+                    "ts=%s channel=%s age=%s",
+                    original_message_ts,
+                    event.get("channel", ""),
+                    _slack_event_age(original_message_ts),
+                )
                 return
             edited = updated_message.get("edited")
             edited_ts = ""
@@ -5772,6 +5810,21 @@ class SlackAdapter(BasePlatformAdapter):
         if event_ts and self._dedup.is_duplicate(
             self._workspace_event_id(dedup_team_id, event_ts)
         ):
+            # INFO (was a silent return): without this line a redelivery is
+            # invisible, so "Slack sent it twice and we caught one" cannot be
+            # told apart from "Slack sent it once". ``age`` shows whether the
+            # duplicate is the app_mention twin (~0s) or a real Socket Mode
+            # replay (seconds to minutes later).
+            logger.info(
+                "[Slack] dropped duplicate event ts=%s team=%s type=%s "
+                "subtype=%s channel=%s age=%s",
+                event_ts,
+                dedup_team_id,
+                event.get("type"),
+                event.get("subtype"),
+                event.get("channel", ""),
+                _slack_event_age(event.get("ts", "") or event_ts),
+            )
             return
 
         channel_id = event.get("channel", "")
@@ -6816,6 +6869,26 @@ class SlackAdapter(BasePlatformAdapter):
                     key=lambda item: item[1],
                 )[-self._PROCESSED_MESSAGE_TS_MAX :]
                 self._processed_message_ts = dict(newest_items)
+
+        # One INFO line per event that actually reaches the gateway — the
+        # anchor for every duplicate investigation. Two of these with the
+        # same ts mean Slack delivered the message twice (and type/subtype
+        # show why the dedup key differed: message vs app_mention vs
+        # message_changed); one line followed by two agent turns means the
+        # second turn was manufactured inside Hermes. ``age``/``ingress``
+        # expose the ack-timeout mechanism that provokes the redelivery.
+        logger.info(
+            "[Slack] delivering event to gateway: ts=%s type=%s subtype=%s "
+            "channel=%s thread_ts=%s user=%s age=%s ingress=%.2fs",
+            ts,
+            event.get("type"),
+            event.get("subtype"),
+            channel_id,
+            thread_ts or "",
+            event.get("user", "") or "",
+            _slack_event_age(ts),
+            time.monotonic() - _ingress_started,
+        )
 
         await self.handle_message(msg_event)
 

@@ -1333,6 +1333,14 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # Diagnostics only: wall-clock marker for "a turn is running right now".
+    # steer() reports it so gateway.log can distinguish a steer that landed
+    # inside a live turn from one accepted microseconds after the turn ended
+    # (the latter is accepted, never injected, and can be lost — the caller
+    # skips queueing because steer() reported success).  Cleared by
+    # finalize_turn.  Nothing branches on this value.
+    agent._active_turn_started_at = time.time()
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()

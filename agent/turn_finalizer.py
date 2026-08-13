@@ -682,7 +682,22 @@ def finalize_turn(
     # delivered as the next user turn instead of being silently lost.
     _leftover_steer = agent._drain_pending_steer()
     if _leftover_steer:
+        # INFO: a steer that was accepted but never injected.  The caller
+        # turns this into a fresh user turn, so this line marks the exact
+        # moment a turn is manufactured from steer text rather than from an
+        # inbound message — and, when the caller cannot deliver it (a queued
+        # follow-up is already waiting), the same line marks where the text
+        # is lost instead.
+        logger.info(
+            "Turn ended with an undelivered /steer (len=%d) — handing it back "
+            "to the caller: '%s...'",
+            len(str(_leftover_steer)),
+            str(_leftover_steer)[:60],
+        )
         result["pending_steer"] = _leftover_steer
+    # Diagnostics marker set by conversation_loop: the turn is over, so a
+    # later steer must report turn_active=False.
+    agent._active_turn_started_at = None
     agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt
