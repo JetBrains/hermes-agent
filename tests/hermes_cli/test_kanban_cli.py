@@ -29,49 +29,15 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+
+
+
 # ---------------------------------------------------------------------------
 # run_slash smoke tests (end-to-end via the same entry both CLI and gateway use)
 # ---------------------------------------------------------------------------
 
-def test_run_slash_request_review_reopen_cycle(kanban_home):
-    out = kc.run_slash("create 'x' --assignee alice")
-    import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
-    # Claim first so request-review finds it running.
-    kc.run_slash(f"claim {tid}")
-    assert "Requested review" in kc.run_slash(
-        f"request-review {tid} --summary 'v1 done'"
-    )
-    show = kc.run_slash(f"show {tid}")
-    assert re.search(r"status:\s+review", show), show
-    # Changes requested -> back to ready.
-    assert "Reopened" in kc.run_slash(f"reopen-review {tid}")
-    show = kc.run_slash(f"show {tid}")
-    assert re.search(r"status:\s+ready", show), show
-
-
-def test_run_slash_unguard_clears_active_pr_guard(kanban_home):
-    """`hermes kanban unguard` is the supported operator path to clear the
-    active_pr respawn guard for a deliberate follow-up — no SQLite surgery."""
-    import re
-    out = kc.run_slash("create 'x' --assignee alice")
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
-    # A worker left a PR link in a recent comment → active_pr guard trips.
-    kc.run_slash(f"comment {tid} 'PR opened: https://github.com/o/r/pull/7'")
-    with kb.connect() as conn:
-        assert kb.check_respawn_guard(conn, tid) == "active_pr"
-    # Operator clears it via the CLI.
-    out = kc.run_slash(f"unguard {tid} --reason 'intentional follow-up'")
-    assert "Cleared active_pr respawn guard" in out
-    with kb.connect() as conn:
-        assert kb.check_respawn_guard(conn, tid) is None
-        events = kb.list_events(conn, tid)
-    assert any(e.kind == "respawn_guard_cleared" for e in events)
-
-
-def test_run_slash_unguard_unknown_task_reports_error(kanban_home):
-    out = kc.run_slash("unguard t_deadbeef")
-    assert "cannot unguard" in out
 
 
 def test_kanban_list_json_includes_session_id(kanban_home):
@@ -89,6 +55,19 @@ def test_kanban_list_json_includes_session_id(kanban_home):
         and row.get("session_id") == "acp-x"
         for row in payload
     )
+
+
+def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
+    with kb.connect_closing() as conn:
+        parent_id = kb.create_task(conn, title="parent task")
+        child_id = kb.create_task(conn, title="child task")
+        kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+
+    output = kc.run_slash(f"show {child_id}")
+
+    assert f"Task {child_id}: child task" in output
+    assert f"parents:   {parent_id}" in output
+    assert "Cannot operate on a closed database" not in output
 
 
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
@@ -142,6 +121,10 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 # ---------------------------------------------------------------------------
 
 
+
+
+
+
 # ---------------------------------------------------------------------------
 # reclaim + reassign CLI smoke tests
 # ---------------------------------------------------------------------------
@@ -184,6 +167,8 @@ def test_run_slash_reclaim_running_task(kanban_home):
     assert "ready" in out2.lower()
 
 
+
+
 # ---------------------------------------------------------------------------
 # /kanban specify — slash surface (same entry point CLI + gateway use)
 # ---------------------------------------------------------------------------
@@ -194,3 +179,43 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# /kanban unguard — operator override for the active_pr respawn guard
+# ---------------------------------------------------------------------------
+
+
+def test_run_slash_unguard_clears_active_pr_guard(kanban_home):
+    """`hermes kanban unguard` is the supported operator path to clear the
+    active_pr respawn guard for a deliberate follow-up — no SQLite surgery."""
+    import re
+    import time
+    out = kc.run_slash("create 'x' --assignee alice")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    # A worker left a PR link in a recent comment → active_pr guard trips.
+    # The finished run is what makes that PR plausibly this task's: the guard
+    # is about a RE-spawn and stands down for a task that never ran at all.
+    with kb.connect() as conn:
+        ts = int(time.time()) - 3600
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at, "
+            "ended_at, outcome) VALUES (?, 'alice', 'released', ?, ?, 'crashed')",
+            (tid, ts, ts),
+        )
+        conn.commit()
+    kc.run_slash(f"comment {tid} 'PR opened: https://github.com/o/r/pull/7'")
+    with kb.connect() as conn:
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+    # Operator clears it via the CLI.
+    out = kc.run_slash(f"unguard {tid} --reason 'intentional follow-up'")
+    assert "Cleared active_pr respawn guard" in out
+    with kb.connect() as conn:
+        assert kb.check_respawn_guard(conn, tid) is None
+        events = kb.list_events(conn, tid)
+    assert any(e.kind == "respawn_guard_cleared" for e in events)
+
+
+def test_run_slash_unguard_unknown_task_reports_error(kanban_home):
+    out = kc.run_slash("unguard t_deadbeef")
+    assert "cannot unguard" in out

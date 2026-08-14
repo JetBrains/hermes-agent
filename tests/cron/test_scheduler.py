@@ -9,9 +9,65 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import (
+    SILENT_MARKER,
+    _build_job_prompt,
+    _deliver_result,
+    _merge_mcp_into_per_job_toolsets,
+    _resolve_cron_enabled_toolsets,
+    _resolve_delivery_target,
+    _resolve_origin,
+    _send_media_via_adapter,
+    _summarize_cron_failure_for_delivery,
+    run_job,
+)
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+class TestSummarizeCronFailureForDelivery:
+    def test_embedded_429_in_source_identifier_is_not_a_rate_limit(self):
+        summary = _summarize_cron_failure_for_delivery(
+            {"name": "LLM Wiki Incremental Index", "no_agent": True},
+            "Script failed: path/hash429abc.md source snapshot failure",
+        )
+
+        assert "provider rate limit" not in summary
+        assert "hash429abc.md" in summary
+
+    def test_http_429_is_still_classified_as_a_rate_limit(self):
+        summary = _summarize_cron_failure_for_delivery(
+            {"name": "provider-backed job"},
+            "HTTP 429: Too Many Requests",
+        )
+
+        assert "provider rate limit" in summary
+        # Chain wording is now honest (#85508): either the exhausted phrase
+        # (chain configured) or the "No fallback chain configured" guidance.
+        assert "fallback chain" in summary.lower()
+
+    def test_no_agent_rate_limit_does_not_claim_a_fallback_chain(self):
+        summary = _summarize_cron_failure_for_delivery(
+            {"name": "script job", "no_agent": True},
+            "HTTP 429: Too Many Requests",
+        )
+
+        # Composed with #77648: a no_agent job never gets provider-shaped
+        # classification at all — the generic cleaner reports the script's
+        # own error instead.
+        assert "provider" not in summary.lower()
+        assert "fallback chain" not in summary.lower()
+
+    def test_no_agent_timeout_is_identified_as_a_script_timeout(self):
+        summary = _summarize_cron_failure_for_delivery(
+            {"name": "script job", "no_agent": True},
+            "Script timed out after 3600s",
+        )
+
+        assert "script timed out" in summary
+        assert "No model was invoked" in summary
+        assert "provider timeout" not in summary
+        assert "fallback chain" not in summary.lower()
 
 
 class TestPerJobToolsetMcpMerge:
@@ -532,6 +588,49 @@ class TestRunJobSessionPersistence:
             mock_agent_cls = entered[-1]  # the AIAgent patch
             yield fake_db, mock_agent_cls
 
+
+    def test_run_job_memory_toolset_disabled_in_cron(self, tmp_path):
+        """memory toolset must be disabled in cron sessions — issue #38129.
+
+        Cron agents are constructed with skip_memory=True, so the memory
+        backend is not initialised.  Exposing the memory tool only gives the
+        model an unbacked tool that fails at runtime with
+        "Memory is not available."  Hiding it from the schema prevents that.
+        """
+        job = {
+            "id": "memory-hide-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert "memory" in (kwargs["disabled_toolsets"] or []), (
+            "memory toolset should be disabled in cron to match skip_memory=True"
+        )
+
+    def test_run_job_disables_memory_even_when_per_job_enables_it(self, tmp_path):
+        """Cron runs pass skip_memory=True, so memory must not be exposed.
+
+        A cron job can request the memory tool through enabled_toolsets, but
+        there is no MemoryStore injected for cron agents.  Keep memory in the
+        disabled set so AIAgent filters the unbacked tool out before the model
+        can call it and receive "Memory is not available" failures.
+        """
+        job = {
+            "id": "memory-toolset-job",
+            "name": "test",
+            "prompt": "remember what you learn",
+            "enabled_toolsets": ["memory", "file"],
+        }
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is True
+        assert kwargs["enabled_toolsets"] == ["memory", "file"]
+        assert "memory" in kwargs["disabled_toolsets"]
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
@@ -1149,12 +1248,20 @@ class TestBuildJobPromptBumpUse:
 
         with patch("tools.skills_tool.skill_view", side_effect=_skill_view), \
              patch("tools.skill_usage.bump_use") as mock_bump:
-            _build_job_prompt({"skills": ["alpha", "beta"], "prompt": "go"})
+            _build_job_prompt({
+                "id": "cron-task",
+                "skills": ["alpha", "beta"],
+                "prompt": "go",
+            })
 
         assert mock_bump.call_count == 2
         calls = [c[0][0] for c in mock_bump.call_args_list]
         assert "alpha" in calls
         assert "beta" in calls
+        assert all(
+            call.kwargs == {"task_id": "cron-task"}
+            for call in mock_bump.call_args_list
+        )
 
 
 class TestSendMediaViaAdapter:
@@ -1217,7 +1324,7 @@ class TestParallelTick:
         barrier = threading.Barrier(2, timeout=5)
         call_order = []
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
+        def mock_run_job(job, *, defer_agent_teardown=None, **kw):
             """Each job hits a barrier — both must be active simultaneously."""
             call_order.append(("start", job["id"]))
             barrier.wait()  # blocks until both threads reach here
@@ -1251,7 +1358,7 @@ class TestParallelTick:
         from gateway.session_context import get_session_env
         seen = {}
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
+        def mock_run_job(job, *, defer_agent_teardown=None, **kw):
             origin = job.get("origin", {})
             # run_job sets ContextVars — verify each job sees its own
             from gateway.session_context import set_session_vars, clear_session_vars
@@ -1885,6 +1992,30 @@ class TestMultiTargetDeliveryContinuesOnFailure:
         assert "b@example.com" in result
         assert mock_pool.submit.call_count == 2
 
+class TestBuildJobPromptExtraPrompt:
+    """Regression: _build_job_prompt merges extra_prompt into the assembled prompt."""
+
+    def test_extra_prompt_appended_with_header(self):
+        """extra_prompt appears under a '## Run Context' header."""
+        job = {"prompt": "stored prompt"}
+        result = _build_job_prompt(job, extra_prompt="CONTEXT: client=Foo")
+        assert "stored prompt" in result
+        assert "## Run Context" in result
+        assert "CONTEXT: client=Foo" in result
+
+    def test_extra_prompt_does_not_mutate_job(self):
+        """The job dict's 'prompt' field must remain unchanged."""
+        job = {"prompt": "original"}
+        _build_job_prompt(job, extra_prompt="transient context")
+        assert job["prompt"] == "original"
+
+    def test_no_extra_prompt_omits_header(self):
+        """Without extra_prompt, no '## Run Context' header is injected."""
+        job = {"prompt": "just the stored prompt"}
+        result = _build_job_prompt(job)
+        assert "## Run Context" not in result
+        assert "just the stored prompt" in result
+
 
 class TestSetCronSessionTitle:
     """Robust cron session titling: #50535/#50536/#50537."""
@@ -1899,5 +2030,4 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
 

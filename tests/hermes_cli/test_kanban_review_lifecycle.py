@@ -182,6 +182,88 @@ def test_request_review_unknown_task_returns_false(kanban_home: Path) -> None:
         assert kb.request_review(conn, "t_deadbeefcafe") is False
 
 
+def test_request_review_refuses_to_clear_live_claim_without_ownership(
+    kanban_home: Path,
+) -> None:
+    """M1 regression: a run-id-less caller must not steal a live worker's claim.
+
+    ``request_review`` on a running+claimed task without ``expected_run_id``
+    fails with a distinct reason instead of silently NULLing claim_lock /
+    worker_pid. ``force=True`` (explicit human override) and the worker path
+    (``expected_run_id=<own run>``) both still work.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="live claim", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+
+        # 1) No run id, no force -> refused with a distinct reason.
+        ok, reason = kb.request_review(conn, tid, with_reason=True)
+        assert ok is False
+        assert reason is not None and "live claim" in reason
+        row = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_lock"] is not None  # live claim untouched
+        # bool-mode caller sees plain False.
+        assert kb.request_review(conn, tid) is False
+
+        # 2) Worker path: proving ownership via expected_run_id works.
+        assert kb.request_review(
+            conn, tid, summary="done", expected_run_id=claimed.current_run_id,
+        ) is True
+        assert kb.get_task(conn, tid).status == "review"
+
+    # 3) force=True: explicit human override on a fresh live-claimed task.
+    with kb.connect() as conn:
+        tid2 = kb.create_task(conn, title="forced", assignee="worker")
+        assert kb.claim_task(conn, tid2) is not None
+        assert kb.request_review(conn, tid2, summary="override", force=True) is True
+        assert kb.get_task(conn, tid2).status == "review"
+
+
+def test_request_review_malformed_provenance_gets_distinct_reason(
+    kanban_home: Path,
+) -> None:
+    """M1 regression: malformed re-review provenance is a named failure, not
+    the generic 'unknown id or not in running/ready'."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="provenance", assignee="builder")
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="v1", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        assert kb.request_changes(
+            conn, tid, reason="fix", expected_run_id=review.current_run_id,
+        ) == (True, "builder")
+        # Corrupt the changes_requested payload so re-review cannot recover
+        # the prior reviewer.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = '{\"reviewer\": 42}' "
+                "WHERE task_id = ? AND kind = 'changes_requested'",
+                (tid,),
+            )
+        retry = kb.claim_task(conn, tid, claimer="builder:retry")
+        assert retry is not None
+        ok, reason = kb.request_review(
+            conn, tid, summary="v2",
+            expected_run_id=retry.current_run_id, with_reason=True,
+        )
+        assert ok is False
+        assert reason is not None and "provenance" in reason
+        # Passing reviewer explicitly recovers, as the reason instructs.
+        assert kb.request_review(
+            conn, tid, summary="v2", reviewer="reviewer",
+            expected_run_id=retry.current_run_id,
+        ) is True
+
+
 @pytest.mark.parametrize("blank", ["   ", "\n", "\t\n  "])
 def test_request_review_whitespace_only_summary_does_not_crash(
     kanban_home: Path, blank: str
@@ -258,7 +340,6 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
             platform="slack",
             chat_id="C123",
             thread_id="T1",
-            delivery_mode="wake",
         )
         kb.claim_task(conn, tid)
         kb.request_review(
@@ -287,7 +368,7 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# Dispatcher gate: no phantom reviewer without an autonomous reviewer agent
+# Dispatcher gate: operators may opt out of autonomous review dispatch
 # ---------------------------------------------------------------------------
 
 
@@ -295,8 +376,8 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With ``kanban.review_dispatch=false`` the dispatcher must NOT claim a
-    task parked in ``review`` (no autonomous reviewer in this deployment —
-    it waits for a human). Flipping the knob back on proves the gate, not
+    task parked in ``review`` (this deployment explicitly waits for a human).
+    Flipping the knob back on proves the gate, not
     something else, is what suppressed the claim."""
     import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
@@ -323,14 +404,210 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
         assert tid not in [s[0] for s in res_off.spawned]
         assert kb.get_task(conn, tid).status == "review"
 
-        # Gate ON (opt-in; requires an installed sdlc-review agent) -> the
-        # review task is picked up by the dispatcher.
+        # Gate ON (the default; sdlc-review is bundled) -> the review task is
+        # picked up by the dispatcher.
         monkeypatch.setattr(
             cfgmod, "load_config",
             lambda *a, **k: {"kanban": {"review_dispatch": True}},
         )
         res_on = kb.dispatch_once(conn, dry_run=True)
         assert tid in [s[0] for s in res_on.spawned]
+
+
+def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2 regression: a fresh PR-URL comment must not block reviewer spawns.
+
+    A task parked in ``review`` with a PR link younger than 24h is the
+    CANONICAL review handoff (worker opened a PR then requested review) —
+    the review-lane dispatch must still claim/spawn it. The same comment on
+    a ready-lane task is a duplicate-work signal and stays deferred.
+    Rate-limit cooldown still applies in the review lane.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    pr_comment = "Opened https://github.com/example/repo/pull/123 for review."
+
+    with kb.connect() as conn:
+        # Review-lane task with a fresh PR comment.
+        review_id = kb.create_task(conn, title="review me", assignee="reviewer")
+        claimed = kb.claim_task(conn, review_id)
+        assert claimed is not None
+        kb.add_comment(conn, review_id, author="worker", body=pr_comment)
+        assert kb.request_review(
+            conn, review_id, summary="PR ready",
+            expected_run_id=claimed.current_run_id,
+        )
+        # Ready-lane task with the same fresh PR comment. It also needs a
+        # finished run: the ready-lane active_pr rule guards a *re*-spawn ("a
+        # prior worker already opened a PR"), so a task with no run history at
+        # all reads as a first spawn and the PR link as inherited context —
+        # see test_respawn_guard_active_pr_never_ran_task_is_not_guarded in
+        # tests/hermes_cli/test_kanban_db.py. ``crashed`` keeps the
+        # recent_success and rate_limit_cooldown rules out of the way.
+        ready_id = kb.create_task(conn, title="already PRed", assignee="worker")
+        _prior = int(__import__("time").time()) - 3600
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "started_at, ended_at) VALUES (?, 'worker', 'released', "
+                "'crashed', ?, ?)",
+                (ready_id, _prior, _prior),
+            )
+        kb.add_comment(conn, ready_id, author="worker", body=pr_comment)
+
+        assert kb.check_respawn_guard(conn, ready_id) == "active_pr"
+        assert kb.check_respawn_guard(conn, review_id, lane="review") is None
+
+        res = kb.dispatch_once(conn, dry_run=True)
+        spawned_ids = [s[0] for s in res.spawned]
+        guarded = dict(res.respawn_guarded)
+        assert review_id in spawned_ids
+        assert ready_id not in spawned_ids
+        assert guarded.get(ready_id) == "active_pr"
+
+        # Rate-limit cooldown still defers the review lane.
+        _now = int(__import__("time").time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "started_at, ended_at) VALUES (?, 'reviewer', 'rate_limited', "
+                "'rate_limited', ?, ?)",
+                # ended_at strictly after the review-handoff run so the
+                # "latest run" query deterministically picks this one.
+                (review_id, _now, _now + 5),
+            )
+        assert kb.check_respawn_guard(
+            conn, review_id, lane="review"
+        ) == "rate_limit_cooldown"
+
+
+def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+    )
+    captured: list[list[str]] = []
+
+    def spawn(task, workspace):
+        captured.append(list(task.skills or []))
+        return None
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="domain review",
+            assignee="reviewer",
+            skills=["domain-specific-review"],
+        )
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+        monkeypatch.setattr(
+            kb,
+            "check_respawn_guard",
+            lambda _conn, _task_id, **_kw: "rate_limit_cooldown",
+        )
+        guarded = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert guarded.respawn_guarded == [(task_id, "rate_limit_cooldown")]
+        assert not guarded.spawned
+        guarded_task = kb.get_task(conn, task_id)
+        assert guarded_task is not None
+        assert guarded_task.status == "review"
+
+        monkeypatch.setattr(kb, "check_respawn_guard", lambda _conn, _task_id, **_kw: None)
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+
+    assert task_id in [task[0] for task in result.spawned]
+    assert captured == [["domain-specific-review", "sdlc-review"]]
+
+
+def test_review_dispatch_honors_global_and_per_profile_caps(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+    )
+
+    with kb.connect() as conn:
+        running_id = kb.create_task(conn, title="already running", assignee="builder")
+        running = kb.claim_task(conn, running_id)
+        assert running is not None
+
+        review_ids: list[str] = []
+        for title in ("review one", "review two"):
+            task_id = kb.create_task(conn, title=title, assignee="reviewer")
+            implementation = kb.claim_task(conn, task_id)
+            assert implementation is not None
+            assert kb.request_review(
+                conn,
+                task_id,
+                summary="ready",
+                expected_run_id=implementation.current_run_id,
+            )
+            review_ids.append(task_id)
+
+        globally_capped = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_in_progress=1,
+        )
+        assert not [
+            task for task in globally_capped.spawned if task[0] in review_ids
+        ]
+
+        assert kb.complete_task(
+            conn,
+            running_id,
+            expected_run_id=running.current_run_id,
+        )
+        global_dry_run = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_in_progress=1,
+        )
+        assert len([
+            task for task in global_dry_run.spawned if task[0] in review_ids
+        ]) == 1
+
+        per_profile_capped = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_in_progress=10,
+            max_in_progress_per_profile=1,
+        )
+        spawned_reviews = [
+            task for task in per_profile_capped.spawned if task[0] in review_ids
+        ]
+        assert len(spawned_reviews) == 1
+        assert len(per_profile_capped.skipped_per_profile_capped) == 1
+        assert per_profile_capped.skipped_per_profile_capped[0][0] in review_ids
 
 
 # ---------------------------------------------------------------------------
@@ -346,15 +623,21 @@ def test_reopen_review_task_returns_to_ready(kanban_home: Path) -> None:
         tid = kb.create_task(conn, title="reopen me", assignee="worker")
         kb.claim_task(conn, tid)
         kb.request_review(
-            conn, tid, summary="v1",
+            conn, tid, summary="v1", reviewer="reviewer",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
-        assert kb.get_task(conn, tid).status == "review"
+        reviewing = kb.get_task(conn, tid)
+        assert reviewing is not None
+        assert reviewing.status == "review"
+        assert reviewing.assignee == "reviewer"
 
         ok = kb.reopen_review_task(conn, tid)
         assert ok is True
         row = _row(conn, tid)
         assert row["status"] == "ready"
+        reopened = kb.get_task(conn, tid)
+        assert reopened is not None
+        assert reopened.assignee == "worker"
         assert row["current_run_id"] is None
         assert (row["block_recurrences"] or 0) == 0
         assert _events(conn, tid, kind="review_reopened")
@@ -424,20 +707,18 @@ def test_request_review_on_unclaimed_ready_synthesizes_run(kanban_home: Path) ->
         assert evs[0][1]["summary"] == "done without a claim"
 
 
-def test_reviewer_is_informational_and_does_not_reassign(kanban_home: Path) -> None:
-    """``reviewer`` is recorded on the event but must NOT reassign the task —
-    in the human-review model the task stays attributed to the implementer."""
+def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
+    """An explicit reviewer routes the review run while preserving implementer provenance."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="keep assignee", assignee="worker")
-        kb.claim_task(conn, tid)
+        tid = kb.create_task(conn, title="route reviewer", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
         ok = kb.request_review(
             conn, tid, summary="v1", reviewer="lead-reviewer",
-            expected_run_id=kb.get_task(conn, tid).current_run_id,
+            expected_run_id=claimed.current_run_id,
         )
         assert ok is True
-        # Assignee unchanged.
-        assert kb.get_task(conn, tid).assignee == "worker"
-        # Reviewer captured on the event payload for downstream context.
+        assert kb.get_task(conn, tid).assignee == "lead-reviewer"
         ev = _events(conn, tid, kind="review_requested")[0][1]
         assert ev["reviewer"] == "lead-reviewer"
         assert ev["implementer"] == "worker"

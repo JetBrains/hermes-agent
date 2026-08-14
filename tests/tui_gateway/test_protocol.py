@@ -349,6 +349,82 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
     ]
 
 
+def test_session_resume_rejects_runaway_transcript_before_history_load(
+    server, monkeypatch
+):
+    class _DB:
+        def get_session(self, sid):
+            return {"id": sid, "message_count": 20_001}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, sid):
+            return sid
+
+        def reopen_session(self, _sid):
+            raise AssertionError("oversized session must be rejected before reopen")
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    response = server.handle_request(
+        {
+            "id": "r1",
+            "method": "session.resume",
+            "params": {
+                "session_id": "runaway-session",
+                "omit_messages": True,
+            },
+        }
+    )
+
+    assert response["error"]["code"] == 4130
+    assert "safe resume limit is 20000" in response["error"]["message"]
+
+
+def test_session_resume_guard_failure_fails_open(server, monkeypatch):
+    """A transient guard error must not block resume (fail open, log only)."""
+    reopened = []
+
+    class _DB:
+        def get_session(self, sid):
+            return {"id": sid}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, sid):
+            return sid
+
+        def assert_resume_safe(self, _sid):
+            raise RuntimeError("database is locked")
+
+        def reopen_session(self, sid):
+            reopened.append(sid)
+            return True
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    response = server.handle_request(
+        {
+            "id": "r-open",
+            "method": "session.resume",
+            "params": {
+                "session_id": "transient-guard-session",
+                "omit_messages": True,
+            },
+        }
+    )
+
+    # The guard must not block: no 4130, and any downstream failure must not
+    # be the guard's own "resume safety check failed" error. Reopen being
+    # attempted proves execution moved past the guard.
+    err = response.get("error") or {}
+    assert err.get("code") != 4130
+    assert "resume safety check failed" not in str(err.get("message", ""))
+    assert reopened == ["transient-guard-session"]
+
+
 def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
     """The LRU cap frees the least-recently-active DETACHED sessions when over
     the limit, and never a live-transport / running / mid-build one."""
@@ -582,6 +658,28 @@ def test_completion_handlers_are_pool_routed(completion_method, server):
     assert completion_method in server._LONG_HANDLERS
 
 
+@pytest.mark.parametrize(
+    "voice_or_wake_method",
+    ["voice.toggle", "voice.record", "voice.tts", "wake.start", "wake.status"],
+)
+def test_voice_and_wake_handlers_are_pool_routed(voice_or_wake_method, server):
+    """Voice and wake RPCs must run on the pool, never the WS reader thread.
+
+    Regression: voice.toggle (status) triggers check_voice_requirements() →
+    STT provider auto-detect → a SYNCHRONOUS faster-whisper lazy install (uv/pip
+    subprocess, up to a 300s timeout). Inline on the WS reader loop it blocked
+    prompt.submit / session.list frames queued behind it — the desktop showed
+    sent messages that never reached the agent. Same bug class as #21123 /
+    #50005: anything that can stall for seconds must stay off the reader thread.
+
+    wake.start and wake.status share the same STT lazy-install path via
+    check_wake_word_requirements() → _stt_ready() → _get_provider(), and
+    wake.start additionally calls lazy_deps.ensure() for wake-word engine deps.
+    The desktop polls wake.status on every gateway-ready.
+    """
+    assert voice_or_wake_method in server._LONG_HANDLERS
+
+
 def test_skin_live_switch_end_to_end(server, tmp_path, monkeypatch):
     """Real config + skin files: activating a skin (as `hermes config set` does)
     makes the per-tool reconcile broadcast skin.changed with the resolved palette.
@@ -663,5 +761,4 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert a.frames == []
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
-
 
