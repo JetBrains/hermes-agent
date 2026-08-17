@@ -166,9 +166,13 @@ gateway:
       crashed:             "crashed (worker exited); dispatcher will retry"
       timed_out:           "timed out; dispatcher will retry"
       blocked:             "blocked; needs attention"
+      review_requested:    "handed off for review; the implementation is done"
+      block_loop_detected: "routed to triage after repeated blocks; needs a decision"
       status_default:      "status changed"
       status_joiner:       ", "
       message:             "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+      handoff:             "Result: {summary}"
+      guidance:            "This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist."
 
   personality:
     none_configured:       "`{path}/config.yaml` に人格が設定されていません"

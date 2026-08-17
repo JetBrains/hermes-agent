@@ -16,11 +16,13 @@ Key design decisions:
 
 import asyncio
 import atexit
+import contextlib
 import errno
 import hashlib
 import json
 import logging
 import os
+import queue
 import random
 import re
 import sqlite3
@@ -52,13 +54,18 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
+    _RESET_END_REASONS,
+    _RESET_END_REASONS_SQL,
     _ephemeral_child_sql,
+    _legacy_reset_child_sql,
     _shape_preview,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
+    escape_like as _escape_like,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_SQL,
+    FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
@@ -82,6 +89,79 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
     psutil = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+MAX_SAFE_RESUME_MESSAGES = 20_000
+MAX_SAFE_EXPORT_MESSAGES = 20_000
+
+
+def _configured_transcript_limit(key: str, fallback: int) -> int:
+    """Resolve a transcript safety limit from config at call time.
+
+    Reads ``sessions.<key>`` from config.yaml lazily (avoiding a circular
+    import at module load) and falls back to the module constant when the
+    config subsystem is unavailable (scaffold installs, stripped test
+    environments). A value of 0 disables the guard entirely. No caching:
+    ``load_config_readonly`` is already mtime-cached, and resolving fresh
+    keeps tests that monkeypatch config or the module constants working.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        sessions_cfg = load_config_readonly().get("sessions") or {}
+        value = sessions_cfg.get(key)
+        if value is None:
+            return fallback
+        limit = int(value)
+        return limit if limit >= 0 else fallback
+    except Exception:
+        return fallback
+
+
+def resolved_max_resume_messages() -> int:
+    """Config-resolved resume guard limit (0 disables the guard)."""
+    return _configured_transcript_limit(
+        "max_resume_messages", MAX_SAFE_RESUME_MESSAGES
+    )
+
+
+def resolved_max_export_messages() -> int:
+    """Config-resolved in-memory export guard limit (0 disables the guard)."""
+    return _configured_transcript_limit(
+        "max_export_messages", MAX_SAFE_EXPORT_MESSAGES
+    )
+
+
+class SessionResumeTooLargeError(ValueError):
+    def __init__(
+        self,
+        message_count: int,
+        limit: int = MAX_SAFE_RESUME_MESSAGES,
+        scope: str = "across its lineage",
+    ):
+        self.message_count = message_count
+        self.limit = limit
+        super().__init__(
+            f"session has at least {message_count} active messages {scope}; "
+            f"safe resume limit is {limit}. Export the session instead, or set "
+            "sessions.max_resume_messages: 0 in config.yaml to disable the guard."
+        )
+
+
+class SessionExportTooLargeError(ValueError):
+    def __init__(
+        self,
+        session_id: str,
+        message_count: int,
+        limit: int = MAX_SAFE_EXPORT_MESSAGES,
+    ):
+        self.session_id = session_id
+        self.message_count = message_count
+        self.limit = limit
+        super().__init__(
+            f"session '{session_id}' has at least {message_count} active messages; "
+            f"safe in-memory export limit is {limit}"
+        )
+
 
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 
@@ -170,9 +250,33 @@ def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
 
+# Sentinel returned by SessionDB._merge_model_config_json when the session row
+# doesn't exist and on_missing="skip" — distinguishes "no row" from the legal
+# None result ("merged config is empty → store NULL").
+_MODEL_CONFIG_ROW_MISSING = object()
+
+# Billing-bucket classes that aren't a routable provider identity on their
+# own — used by session_gateway_runtime's billing_provider fallback and by
+# tui_gateway.server._stored_session_runtime_overrides. A session that
+# persisted only one of these (never ran /model) must fall back to the
+# ambient config default rather than restore a bare bucket. Shared here so
+# both consumers stay in sync (previously duplicated as a set in
+# tui_gateway/server.py).
+_BARE_BILLING_PROVIDERS = frozenset({"auto", "custom"})
+
+
 def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
-    return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
+    # ``_`` and ``%`` are LIKE wildcards but ordinary characters in a path
+    # (``my_project``), so an unescaped prefix also matches sibling directories.
+    # Escape the needle and pair it with ESCAPE; the literal separator
+    # backslash in the Windows pattern needs escaping for the same reason. The
+    # ``=`` arm is an exact compare and keeps the raw prefix.
+    esc = _escape_like(prefix)
+    return (
+        "(s.cwd = ? OR s.cwd LIKE ? ESCAPE '\\' OR s.cwd LIKE ? ESCAPE '\\')",
+        [prefix, f"{esc}/%", f"{esc}\\\\%"],
+    )
 
 
 def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
@@ -243,6 +347,29 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
+# How long SessionDB stops attempting read-only opens after one fails, before
+# probing again. Long enough that a genuinely unreadable file isn't retried per
+# query; short enough that transient fd pressure doesn't strand the read pool.
+_READ_OPEN_RETRY_SECONDS = 60.0
+
+# Hard ceiling on read-only connections ALIVE at once per SessionDB — pooled
+# idle ones and checked-out ones together.
+#
+# Deliberately one constant for both the pool's maxsize and the permit count,
+# because bounding only the pool bounds the wrong thing. A LifoQueue caps how
+# many connections are *returned*; it says nothing about how many are *open*.
+# With an open-on-miss checkout, N readers arriving on an empty pool all miss,
+# all open, and peak at N — the surplus is closed on release, so nothing
+# accumulates forever, but EMFILE is a peak-instant condition and the burst
+# that empties the pool is exactly the burst that exhausts the fd table.
+#
+# So a connection holds a permit for its whole lifetime: acquired in
+# _get_read_conn() before the open, released in _close_read_conn() after the
+# close. Once permits are gone the read path degrades to the locked writer
+# connection instead of opening more descriptors — slower under load, which is
+# the correct trade against a process-wide wedge the supervisor cannot see.
+_READ_POOL_MAX = 8
+
 # Import-time snapshot used by _default_db_path() to detect a deliberately
 # re-pointed DEFAULT_DB_PATH (tests monkeypatch the constant directly).
 _IMPORT_DEFAULT_DB_PATH = DEFAULT_DB_PATH
@@ -266,6 +393,132 @@ def _default_db_path() -> Path:
     if DEFAULT_DB_PATH != _IMPORT_DEFAULT_DB_PATH:
         return DEFAULT_DB_PATH
     return get_hermes_home() / "state.db"
+
+
+# ---------------------------------------------------------------------------
+# Live-DB test-isolation guard
+# ---------------------------------------------------------------------------
+# Forensic evidence (Aug 2026, live developer machine): the production
+# ~/.hermes/state.db accumulated pytest fixture rows — sessions with
+# chat_id='chat-1'/'123'/'wx-chat' and gateway_routing scopes literally under
+# /tmp/pytest-of-*/ — and a pytest-spawned process flipped the journal mode
+# out from under the WAL-mode gateway writer, destroying committed
+# transcripts ("Persisted transcript lagged live cached history ... possible
+# FTS write corruption").  The hermetic conftest redirects HERMES_HOME per
+# test, but any escape (a session-scoped fixture running before the autouse
+# fixture, a subprocess child launched without HERMES_HOME, a stale worktree
+# without the re-pin, or a developer shell that exports HERMES_HOME to the
+# real home so the conftest session sandbox is skipped) silently fell
+# through to the real database.
+#
+# This guard is the single choke point: EVERY ``SessionDB`` construction
+# resolves its path here, so under pytest a resolution that lands on a
+# production state.db fails hard instead of corrupting live data.  It is
+# env-based (``PYTEST_CURRENT_TEST`` / ``PYTEST_VERSION`` are set by pytest
+# and inherited by subprocess children), so it also protects children that
+# never import the test conftest.
+
+#: Escape hatch for the rare legitimate case (a test that genuinely needs
+#: the real DB).  The in-tree conftest sets this for tests marked
+#: ``@pytest.mark.live_system_guard_bypass``; scripts may set it explicitly.
+_STATE_DB_GUARD_BYPASS = False
+
+#: Additional production roots to refuse (beyond the platform default
+#: ``~/.hermes``).  The test conftest injects the pre-sandbox production
+#: root here so custom-``HERMES_HOME`` deployments are covered too.
+_STATE_DB_GUARD_EXTRA_DENY_ROOTS: Tuple[Path, ...] = ()
+
+
+def _real_platform_state_root() -> Optional[Path]:
+    """Resolve the REAL platform-default Hermes root for the guard.
+
+    Deliberately avoids ``Path.home()`` / ``hermes_constants``: tests
+    routinely monkeypatch ``Path.home`` to a tempdir, and ``hermes_state``
+    is often imported lazily *while* such a patch is active — resolving
+    through the patched callable would misidentify the test's own hermetic
+    home as "production" (false positive) or, worse, miss the real one
+    (false negative).  ``os.path.expanduser`` reads the HOME environment
+    variable / passwd entry, which the hermetic conftest never rewrites.
+    """
+    try:
+        if sys.platform == "win32":
+            base = os.environ.get("LOCALAPPDATA", "").strip()
+            root = (
+                Path(base) / "hermes"
+                if base
+                else Path(os.path.expanduser("~")) / "AppData" / "Local" / "hermes"
+            )
+        else:
+            root = Path(os.path.expanduser("~")) / ".hermes"
+        return root.resolve()
+    except Exception:
+        return None
+
+
+def _running_under_pytest() -> bool:
+    """True when this process (or a parent test process) is a pytest run."""
+    return bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("PYTEST_VERSION")
+    )
+
+
+def _production_state_roots() -> List[Path]:
+    roots: List[Path] = []
+    real_root = _real_platform_state_root()
+    if real_root is not None:
+        roots.append(real_root)
+    for extra in _STATE_DB_GUARD_EXTRA_DENY_ROOTS:
+        try:
+            roots.append(Path(extra).expanduser().resolve())
+        except Exception:
+            continue
+    return roots
+
+
+def _is_production_state_db(resolved: Path, root: Path) -> bool:
+    """True when *resolved* is a DB file of the real Hermes home *root*.
+
+    Matches files directly in the root (``<root>/state.db``) and profile
+    homes (``<root>/profiles/<name>/state.db``).  Deliberately does NOT
+    match deeper scratch paths (e.g. repo worktrees that happen to live
+    under ``~/.hermes/hermes-agent/...``) so hermetic tests using unusual
+    tempdirs cannot false-positive.
+    """
+    if resolved.parent == root:
+        return True
+    try:
+        rel = resolved.relative_to(root)
+    except ValueError:
+        return False
+    parts = rel.parts
+    return len(parts) == 3 and parts[0] == "profiles"
+
+
+def _ensure_test_isolation(db_path: Path) -> None:
+    """Fail hard when a pytest-context process resolves a production DB.
+
+    Raises ``RuntimeError`` before any connection, mkdir, journal-mode
+    pragma, or byte probe can touch the live database.  No-op outside
+    pytest and for hermetic (tmp ``HERMES_HOME``) paths.
+    """
+    if _STATE_DB_GUARD_BYPASS or not _running_under_pytest():
+        return
+    try:
+        resolved = Path(db_path).expanduser().resolve()
+    except Exception:
+        return
+    for root in _production_state_roots():
+        if _is_production_state_db(resolved, root):
+            raise RuntimeError(
+                "live-system guard: test attempted to open production "
+                f"state.db at {resolved} (under real Hermes root {root}). "
+                "Tests must run against a temporary HERMES_HOME — pass an "
+                "explicit tmp db_path or let the hermetic conftest redirect "
+                "HERMES_HOME. If this test genuinely needs the live "
+                "database, mark it with "
+                "@pytest.mark.live_system_guard_bypass."
+            )
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -301,6 +554,11 @@ _WAL_INCOMPAT_MARKERS = (
     "not authorized",         # Some FUSE mounts block WAL pragma outright
     "disk i/o error",         # ZFS SHM corruption under concurrent connections
 )
+
+# Upper bound for the write-ahead log. SQLite defaults to -1 (unlimited),
+# which lets state.db-wal keep the high-water mark of the largest-ever
+# transaction forever. See _apply_wal_size_limit().
+_WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024  # 64 MiB
 
 # Last SessionDB() init error, per-process.  Surfaced in /resume and
 # related slash-command error strings so users know WHY the DB is
@@ -484,20 +742,79 @@ def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
 
     Returns the mode string (e.g. ``"wal"``, ``"delete"``), or ``None``
     if the value cannot be determined (new DB, or PRAGMA read failed).
+
+    A PRAGMA read can fail transiently with ``disk i/o error`` on
+    virtualized block devices (XFS on cloud hosts).  Treating that as
+    "mode unknown" pushes callers onto their fail-closed unknown-mode
+    branch even though the on-disk mode is perfectly readable a few
+    milliseconds later.  Retry the read a few times before giving up:
+    transient EIO clears, deterministic unsupported-filesystem errors do
+    not.  ``None`` is still returned on final failure so the caller's
+    existing "unknown → refuse to downgrade" logic applies.
+    """
+    last_exc: Optional[Exception] = None
+    for _ in range(4):
+        try:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            if "disk i/o error" not in str(exc).lower():
+                return None
+            time.sleep(0.05)
+            continue
+        if row is None:
+            return None
+        mode = row[0]
+        if isinstance(mode, bytes):  # defensive: sqlite3 occasionally returns bytes
+            try:
+                mode = mode.decode("ascii")
+            except UnicodeDecodeError:
+                return None
+        return str(mode).strip().lower() if mode is not None else None
+    if last_exc is not None:
+        logger.debug(
+            "_on_disk_journal_mode: retries exhausted on disk read (%s)", last_exc
+        )
+    return None
+
+
+def _apply_wal_size_limit(conn: sqlite3.Connection) -> None:
+    """Bound the WAL so it returns space to the OS after big transactions.
+
+    SQLite's default ``journal_size_limit`` is -1 (unlimited): after a
+    checkpoint the WAL file is *reused in place* and never truncated, so
+    ``state.db-wal`` permanently retains the high-water mark of the largest
+    transaction ever run against it.
+
+    A single bulk operation is enough to strand gigabytes. Observed on a
+    3.0 GB ``state.db``: ``hermes sessions optimize`` (FTS merge + VACUUM)
+    rewrites every page through the WAL, leaving a **3.07 GB**
+    ``state.db-wal`` sitting next to the database indefinitely — the host
+    went from 6.9 GB free to 772 MB (100% full) and stayed there, because
+    nothing shrinks the WAL back down. An explicit
+    ``PRAGMA wal_checkpoint(TRUNCATE)`` reclaimed the full 3.07 GB, which
+    confirms the space was pure slack rather than live data.
+
+    That also makes the maintenance command self-defeating on exactly the
+    databases that need it most: the larger the DB, the larger the WAL it
+    strands, so ``optimize`` can consume more disk than it frees.
+
+    ``journal_size_limit`` makes SQLite truncate the WAL back to the limit
+    at each checkpoint. 64 MiB is comfortably above normal transaction
+    sizes (so steady-state commits never pay a truncate) while capping the
+    stranded slack at a bounded, predictable figure.
+
+    ``hermes_cli/kanban_db.py`` already bounds its WAL growth with
+    ``wal_autocheckpoint=100``; the session store — by far the larger
+    database — had no equivalent.
+
+    Best-effort: never raises. A failure here only costs disk slack, and
+    must not prevent the database from opening.
     """
     try:
-        row = conn.execute("PRAGMA journal_mode").fetchone()
-    except sqlite3.OperationalError:
-        return None
-    if row is None:
-        return None
-    mode = row[0]
-    if isinstance(mode, bytes):  # defensive: sqlite3 occasionally returns bytes
-        try:
-            mode = mode.decode("ascii")
-        except UnicodeDecodeError:
-            return None
-    return str(mode).strip().lower() if mode is not None else None
+        conn.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES}")
+    except sqlite3.OperationalError as exc:  # pragma: no cover - defensive
+        logger.debug("journal_size_limit not applied: %s", exc)
 
 
 def _apply_macos_checkpoint_barrier(conn: sqlite3.Connection) -> None:
@@ -704,20 +1021,30 @@ def apply_wal_with_fallback(
 
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
     # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
-    try:
-        current_mode = conn.execute("PRAGMA journal_mode").fetchone()
-        if current_mode and current_mode[0] == "wal":
-            _apply_macos_checkpoint_barrier(conn)
-            _enforce_macos_synchronous_full(conn)
-            return "wal"
-    except sqlite3.OperationalError:
-        pass
+    current_mode = _on_disk_journal_mode(conn)
+    if current_mode == "wal":
+        _apply_wal_size_limit(conn)
+        _apply_macos_checkpoint_barrier(conn)
+        _enforce_macos_synchronous_full(conn)
+        return "wal"
 
     # #68545: honor the canonical database.journal_mode setting. Existing
     # on-disk WAL databases were returned above and are never live-downgraded.
     if configured == "delete":
-        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
-        actual = str(row[0]).lower() if row else ""
+        if current_mode is None:
+            # The mode probe failed (database locked / busy): another
+            # process may hold this DB open in WAL. Ownership is not
+            # provably exclusive, so flipping journal modes here could
+            # destroy committed-but-uncheckpointed WAL transactions of a
+            # concurrent writer. Fail loudly instead of downgrading — the
+            # operator explicitly requested DELETE and we cannot verify it.
+            raise sqlite3.OperationalError(
+                "could not verify journal mode before applying configured "
+                "journal_mode=delete (database is locked — possible "
+                "concurrent openers); refusing to downgrade a database "
+                "this process does not exclusively own"
+            )
+        actual = _set_journal_mode_no_wait(conn, "DELETE")
         if actual != "delete":
             raise sqlite3.OperationalError(
                 f"could not set configured journal_mode=delete (got {actual or 'no result'})"
@@ -737,6 +1064,7 @@ def apply_wal_with_fallback(
         row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
         mode = str(row[0]).strip().lower() if row and row[0] is not None else ""
         if mode == "wal":
+            _apply_wal_size_limit(conn)
             _apply_macos_checkpoint_barrier(conn)
             _enforce_macos_synchronous_full(conn)
             return "wal"
@@ -785,20 +1113,59 @@ def apply_wal_with_fallback(
                     else ""
                 )
                 if mode == "wal":
+                    _apply_wal_size_limit(conn)
                     _apply_macos_checkpoint_barrier(conn)
                     _enforce_macos_synchronous_full(conn)
                     return "wal"
                 break
-        # Don't downgrade if another process already set WAL on disk.
+        # Don't downgrade if another process already set WAL on disk, or if
+        # the mode cannot be verified at all (probe blocked by a concurrent
+        # opener's locks) — ownership is not provably exclusive either way.
         existing = _on_disk_journal_mode(conn)
-        if existing == "wal":
+        if existing == "wal" or existing is None:
             raise
         if require_wal:
             # Caller mandates WAL — fail loudly instead of degrading to DELETE.
             raise WalUnsupportedError(str(exc)) from exc
         _log_wal_fallback_once(db_label, exc)
-        conn.execute("PRAGMA journal_mode=DELETE")
+        _set_journal_mode_no_wait(conn, "DELETE")
         return "delete"
+
+
+def _set_journal_mode_no_wait(conn: sqlite3.Connection, mode: str) -> str:
+    """Execute ``PRAGMA journal_mode=<mode>`` without waiting on other openers.
+
+    This is the ONLY place a journal-mode switch pragma may be issued for a
+    non-WAL target.  It temporarily forces ``busy_timeout=0`` so SQLite's own
+    exclusivity requirement becomes a concurrent-opener detector: leaving WAL
+    mode requires exclusive access to the database, so if ANY other connection
+    (this process or another) holds the DB open, the pragma fails immediately
+    with ``database is locked`` instead of waiting out a busy timeout and
+    sneaking the flip in between a concurrent writer's transactions — which is
+    exactly how committed-but-uncheckpointed WAL transactions get destroyed.
+
+    Callers must treat a raised ``OperationalError`` as "not exclusively
+    owned: leave the journal mode alone", never as a retryable condition.
+
+    Returns the resulting journal mode as reported by SQLite (lowercase), or
+    ``""`` when SQLite returned no row.
+    """
+    previous_timeout = 0
+    try:
+        row = conn.execute("PRAGMA busy_timeout").fetchone()
+        if row and row[0] is not None:
+            previous_timeout = int(row[0])
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        previous_timeout = 0
+    conn.execute("PRAGMA busy_timeout=0")
+    try:
+        row = conn.execute(f"PRAGMA journal_mode={mode}").fetchone()
+        return str(row[0]).strip().lower() if row and row[0] is not None else ""
+    finally:
+        try:
+            conn.execute(f"PRAGMA busy_timeout={previous_timeout}")
+        except sqlite3.OperationalError:
+            pass
 
 
 def _apply_delete_for_wal_reset_bug(
@@ -810,33 +1177,54 @@ def _apply_delete_for_wal_reset_bug(
     """Avoid enabling WAL when the linked SQLite has the WAL-reset bug.
 
     - Already-WAL on disk: leave WAL alone (no live downgrade) and warn.
-    - Otherwise: set DELETE and warn.
+    - Mode unreadable (probe blocked by a concurrent opener's locks):
+      ownership is not provably exclusive — leave the journal mode alone
+      and warn.  Never treat "could not read the mode" as "not WAL": that
+      exact confusion let a vulnerable-SQLite process flip a live WAL
+      state.db to DELETE under a concurrent WAL writer, destroying its
+      committed-but-uncheckpointed transactions.
+    - Otherwise: set DELETE (refusing to wait out concurrent openers) and
+      warn.
     - For an explicit operator request, verify SQLite accepted DELETE.
     """
-    current = ""
-    try:
-        row = conn.execute("PRAGMA journal_mode").fetchone()
-        if row and row[0] is not None:
-            current = str(row[0]).strip().lower()
-    except sqlite3.OperationalError:
-        current = ""
+    current = _on_disk_journal_mode(conn)
 
     if current == "wal":
         # Do not TRUNCATE / journal_mode=DELETE while other processes may
         # still hold this WAL DB open — same safety rule as the NFS path.
         _log_wal_reset_bug_once(db_label, kept_wal=True)
+        _apply_wal_size_limit(conn)
         _apply_macos_checkpoint_barrier(conn)
         _enforce_macos_synchronous_full(conn)
         return "wal"
 
+    if current is None:
+        # The mode probe itself failed — another opener's locks are the
+        # most likely cause, and the DB may well be in WAL under a live
+        # writer.  Never flip a journal mode we cannot even read.
+        if require_delete:
+            raise sqlite3.OperationalError(
+                "could not verify journal mode before applying configured "
+                "journal_mode=delete (database is locked — possible "
+                "concurrent openers); refusing to downgrade a database "
+                "this process does not exclusively own"
+            )
+        _log_wal_reset_bug_once(db_label, kept_wal=True, indeterminate=True)
+        return "wal"
+
     actual = ""
     try:
-        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
-        if row and row[0] is not None:
-            actual = str(row[0]).strip().lower()
-    except sqlite3.OperationalError:
+        actual = _set_journal_mode_no_wait(conn, "DELETE")
+    except sqlite3.OperationalError as exc:
         if require_delete:
             raise
+        lowered = str(exc).lower()
+        if "locked" in lowered or "busy" in lowered:
+            # A concurrent opener appeared between the probe and the flip
+            # (or already held the DB): SQLite refused the exclusive lock.
+            # Leave the journal mode exactly as it is.
+            _log_wal_reset_bug_once(db_label, kept_wal=True, indeterminate=True)
+            return current or "delete"
         # Best-effort for the automatic vulnerable-runtime fallback: DELETE is
         # normally already the default for new file-backed databases.
     if require_delete and actual != "delete":
@@ -848,32 +1236,73 @@ def _apply_delete_for_wal_reset_bug(
     return "delete"
 
 
+def _wal_reset_repair_hint() -> str:
+    """Return a context-appropriate hint for repairing the SQLite runtime.
+
+    Uses the codebase's install-type detection so the hint matches what
+    ``hermes update`` can actually do for this install (#75153).
+    """
+    try:
+        from hermes_cli.config import (
+            detect_install_method,
+            recommended_update_command_for_method,
+            get_project_root,
+        )
+        method = detect_install_method(get_project_root())
+        cmd = recommended_update_command_for_method(method)
+        if method in {"git", "unknown"}:
+            return f"Hermes-managed installs can repair the embedded runtime with `{cmd}`"
+        if method == "docker":
+            return f"update the container image with `{cmd}`"
+        # nix/nixos
+        return cmd
+    except Exception:
+        pass
+    return (
+        "install a Python build bundled with SQLite 3.51.3+ "
+        "(or backports 3.50.7 / 3.44.6) and restart Hermes"
+    )
+
+
 def _log_wal_reset_bug_once(
     db_label: str,
     *,
     kept_wal: bool,
+    indeterminate: bool = False,
 ) -> None:
     """Log once per (process, db_label) about the WAL-reset vulnerability path."""
     with _wal_reset_bug_warned_lock:
         if db_label in _wal_reset_bug_warned_paths:
             return
         _wal_reset_bug_warned_paths.add(db_label)
-    action = (
-        "is already in WAL mode — leaving WAL in place (no live "
-        "downgrade under concurrent openers)"
-        if kept_wal
-        else "using journal_mode=DELETE instead of enabling WAL"
-    )
+    if indeterminate:
+        action = (
+            "journal mode could not be verified or exclusively switched "
+            "(database is locked — possible concurrent openers); leaving the "
+            "journal mode untouched (no live downgrade under concurrent "
+            "openers)"
+        )
+    elif kept_wal:
+        action = (
+            "is already in WAL mode — leaving WAL in place (no live "
+            "downgrade under concurrent openers)"
+        )
+    else:
+        action = "using journal_mode=DELETE instead of enabling WAL"
+    # Check whether this is a Hermes-managed install (uv-managed venv)
+    # so the warning doesn't promise a repair path that doesn't exist
+    # for git/pip/system Python installs (#75153).
+    repair_hint = _wal_reset_repair_hint()
     logger.warning(
         "%s: linked SQLite %s is vulnerable to the WAL-reset corruption "
         "bug (https://sqlite.org/wal.html#walresetbug) — %s. "
         "Upgrade to SQLite 3.51.3+ (or backports 3.50.7 / 3.44.6); "
-        "Hermes-managed installs can repair the embedded runtime with "
-        "`hermes update`. See `hermes doctor`. This warning fires once per "
+        "%s. See `hermes doctor`. This warning fires once per "
         "process per database.",
         db_label,
         sqlite3.sqlite_version,
         action,
+        repair_hint,
     )
 
 
@@ -1014,6 +1443,21 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
 
 
+def _is_not_a_database_error(exc: BaseException) -> bool:
+    """True if *exc* is SQLite's 'file is not a database' error.
+
+    Raised when a connection's backing file is not a SQLite database — the
+    runtime connection-corruption class: a sibling process (forked curator
+    agent, external repair pass) replaced/truncated the file out from under
+    the live connection.  The file on disk may be perfectly healthy; the
+    CONNECTION is broken.  Distinct from the malformed-schema class: the fix
+    is a reconnect, not schema surgery.
+    """
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    return "file is not a database" in str(exc).lower()
+
+
 # Markers that mean the host filesystem cannot accept another write. Kept as
 # plain substrings so OSError, sqlite3.OperationalError, and wrapped RPC
 # error strings all match the same helper.
@@ -1044,6 +1488,58 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
     return any(marker in lowered for marker in _DISK_FULL_MARKERS)
 
 
+# Every cause bucket classify_persistence_error can return. Consumers that
+# enumerate causes (e.g. the cron scheduler's explainer-variant suppression)
+# must iterate this tuple instead of hardcoding the list, so adding a bucket
+# can never silently desynchronize them.
+PERSISTENCE_ERROR_CAUSES = ("locked", "disk", "unknown")
+
+
+def classify_persistence_error(exc_or_str) -> str:
+    """Classify a session-persistence failure into a coarse cause bucket.
+
+    Fast-failing a turn on a SessionDB write error is deliberate (the
+    transcript would otherwise be lost on restart), but the *guidance* the
+    user gets must match the cause: sustained SQLite write-lock contention
+    ("database is locked" on a shared state.db) needs "storage was busy,
+    send it again", while a full disk or read-only database needs the
+    disk-space/permissions advice. Returns one of PERSISTENCE_ERROR_CAUSES:
+
+    * ``"locked"``  — lock/busy contention (another process holds the write
+      lock, or a live compression lease refused the write); transient,
+      retry-later guidance applies.
+    * ``"disk"``    — disk full / read-only / permission-shaped failures
+      (delegates the disk-full patterns to :func:`is_disk_full_error` so the
+      two classifiers can never drift apart — e.g. ENOSPC).
+    * ``"unknown"`` — anything else (or no visible exception at all).
+    """
+    if exc_or_str is None:
+        return "unknown"
+    # A refused write during a live compression lease is contention, not
+    # storage damage — but its message ("is being compressed by another
+    # writer" / "Compression lease lost") contains neither "locked" nor
+    # "busy", so it must be matched by type and by phrase (for strings that
+    # survived RPC wrapping).
+    if isinstance(exc_or_str, CompressionSessionBusyError):
+        return "locked"
+    text = str(exc_or_str).lower()
+    if (
+        "locked" in text
+        or "busy" in text
+        or "being compressed" in text
+        or "compression lease" in text
+    ):
+        return "locked"
+    if (
+        is_disk_full_error(exc_or_str)
+        or "disk" in text
+        or "readonly" in text
+        or "read-only" in text
+    ):
+        return "disk"
+    return "unknown"
+
+
 def _claim_repair_attempt(db_path: Path) -> bool:
     """Claim the one-shot repair attempt for *db_path* in this process.
 
@@ -1059,12 +1555,137 @@ def _claim_repair_attempt(db_path: Path) -> bool:
         return True
 
 
-def _backup_db_file(db_path: Path) -> Optional[Path]:
+# Cross-process serialisation for the schema-surgery paths below.  The
+# ``_repair_attempt_lock`` above is a ``threading.Lock`` — it only covers
+# threads inside ONE interpreter, yet a normal Hermes host runs several
+# independent processes against the same ``state.db``: the gateway service,
+# the Desktop app's own ``hermes serve`` backend, interactive CLI sessions,
+# and the TUI slash worker.  Two of those hitting a malformed DB at once each
+# ran the full ``writable_schema`` surgery + ``VACUUM`` on their own private
+# connection, with nothing serialising them.
+#
+# The timeout is sized for the slowest legitimate holder — a ``VACUUM`` over a
+# multi-GB DB in strategy 2.  Waiting that long is not a new stall: before this
+# lock the losing caller spent the same minutes running its own surgery, it
+# just did so on top of the winner's.
+_REPAIR_LOCK_TIMEOUT_SECONDS = 120.0
+_REPAIR_LOCK_POLL_SECONDS = 0.1
+_IS_WINDOWS = sys.platform == "win32"
+
+
+@contextlib.contextmanager
+def _cross_process_repair_lock(db_path: Path):
+    """Serialize state.db schema surgery across processes.
+
+    Yields True when this process holds the repair lock for *db_path*, False
+    when the bounded acquire timed out.  Unlike the kanban init lock — whose
+    critical section is idempotent, so proceeding without the lock is merely
+    redundant work — proceeding here would be exactly the unsafe interleaving
+    we are trying to prevent, so a caller that gets False must NOT do surgery.
+
+    ``flock`` is the right primitive for this: the kernel drops the lock when
+    the holding process dies, so a crashed repairer cannot leave a stale lock
+    that wedges every future repair (a pidfile would).  The acquire is still
+    bounded because a *live* repairer can legitimately sit in ``VACUUM`` for
+    minutes on a large DB, and an unbounded wait would hang the caller's open
+    with no traceback (the failure shape of #36644).
+    """
+    lock_path = db_path.with_name(db_path.name + ".repair.lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+    except OSError as exc:
+        # Read-only dir, exhausted fds, exotic filesystem: fall back to the
+        # in-process behaviour that shipped before this lock existed rather
+        # than refusing to repair a DB we could otherwise heal.
+        logger.warning(
+            "Could not open state.db repair lock %s (%s) — proceeding with "
+            "in-process serialisation only.", lock_path, exc,
+        )
+        yield True
+        return
+
+    acquired = False
+    try:
+        deadline = time.monotonic() + _REPAIR_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(_REPAIR_LOCK_POLL_SECONDS)
+        if not acquired:
+            logger.warning(
+                "state.db repair lock %s held by another process for more "
+                "than %.0fs — skipping schema surgery in this process to "
+                "avoid racing the repairer.",
+                lock_path, _REPAIR_LOCK_TIMEOUT_SECONDS,
+            )
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover - best effort release
+            pass
+        finally:
+            handle.close()
+
+
+def _bump_schema_cookie(conn: sqlite3.Connection) -> None:
+    """Increment the schema cookie after direct ``sqlite_master`` surgery.
+
+    Ordinary DDL bumps this counter for free, and every other connection
+    compares it before running a prepared statement — that is how they learn
+    to discard a cached schema.  Editing ``sqlite_master`` under
+    ``PRAGMA writable_schema=ON`` does NOT bump it, so live connections in
+    other processes keep compiling statements against the schema we just
+    deleted objects from — e.g. writing ``messages`` rows through triggers
+    into ``messages_fts*`` shadow tables that no longer exist.  SQLite's
+    writable_schema documentation calls out incrementing ``schema_version``
+    as the required companion to such an edit.
+
+    Best-effort and never raises: a failed bump leaves exactly the
+    pre-existing behaviour, and the repair itself is still worth completing.
+    """
+    try:
+        current = conn.execute("PRAGMA schema_version").fetchone()[0]
+        # Wraps within the 32-bit signed range SQLite stores this in; the
+        # comparison other connections make is equality, not ordering.
+        conn.execute(f"PRAGMA schema_version={(int(current) + 1) & 0x7FFFFFFF}")
+    except (sqlite3.DatabaseError, TypeError, IndexError) as exc:
+        logger.warning("Could not bump state.db schema cookie: %s", exc)
+
+
+def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
     """Copy a (possibly malformed) DB file to a timestamped backup beside it.
 
     Raw file copy on purpose: the DB won't open cleanly, so we preserve the
     bytes exactly for forensics / manual restore. WAL and SHM sidecars are
-    copied too when present. Returns the backup path, or None on failure.
+    copied too when present. Returns ``(backup_path, None)`` on success or
+    ``(None, reason)`` on failure — callers on the repair path treat a
+    refused backup as a HARD STOP (see #69603: proceeding without the
+    pre-repair backup leaves the writable_schema surgery, FTS deletion and
+    VACUUM strategies mutating the only remaining copy of the damaged DB).
 
     Refuses when a connection to this database is still live in the process:
     reading the file would ``close()`` a descriptor for it and cancel that
@@ -1081,13 +1702,13 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
         has_live_connection = None  # type: ignore[assignment]
 
     if has_live_connection is not None and has_live_connection(db_path):
-        logger.error(
-            "Refusing to raw-copy %s for backup: a connection to it is still "
-            "open in this process and the copy would cancel that connection's "
-            "POSIX locks. Close all SessionDB handles first.",
-            db_path,
+        reason = (
+            f"a connection to {db_path} is still open in this process; "
+            "raw-copying it would cancel that connection's POSIX advisory "
+            "locks. Close all SessionDB handles first."
         )
-        return None
+        logger.error("Refusing to raw-copy %s for backup: %s", db_path, reason)
+        return None, reason
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
@@ -1097,10 +1718,10 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
             sidecar = db_path.with_name(db_path.name + suffix)
             if sidecar.exists():
                 shutil.copy2(sidecar, backup_path.with_name(backup_path.name + suffix))
-        return backup_path
+        return backup_path, None
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
-        return None
+        return None, f"backup copy failed: {exc}"
 
 
 def preflight_db_writability(
@@ -1343,6 +1964,12 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     Canonical ``sessions`` / ``messages`` rows are never modified. A
     timestamped raw backup is taken first unless ``backup=False``.
 
+    The surgery below is serialised across processes (see
+    :func:`_cross_process_repair_lock`): the gateway service, the Desktop
+    app's backend and interactive CLI sessions all open the same file, and
+    two of them running ``writable_schema`` surgery concurrently is itself a
+    corruption source.
+
     Returns a report dict: ``{repaired: bool, strategy: str|None,
     backup_path: str|None, error: str|None}``.
     """
@@ -1358,14 +1985,55 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         report["error"] = f"{db_path} does not exist"
         return report
 
+    with _cross_process_repair_lock(db_path) as holding_lock:
+        if not holding_lock:
+            # Another process is still inside its critical section. It may
+            # nonetheless have healed the file already (long VACUUM after a
+            # successful strategy), so re-probe before reporting failure.
+            if _db_opens_cleanly(db_path) is None:
+                report["repaired"] = True
+                report["strategy"] = "repaired_by_other_process"
+                return report
+            report["error"] = (
+                "another process holds the state.db repair lock; skipped "
+                "schema surgery to avoid racing it"
+            )
+            return report
+        return _repair_state_db_schema_locked(db_path, backup=backup, report=report)
+
+
+def _repair_state_db_schema_locked(
+    db_path: Path, *, backup: bool, report: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Repair strategies for :func:`repair_state_db_schema`.
+
+    Caller must hold the cross-process repair lock for *db_path*.
+    """
+    # Re-probe under the lock: a process we queued behind may have just
+    # repaired the file, in which case redoing the surgery would undo its
+    # work on a now-healthy DB (the repair/re-corrupt cascade this lock
+    # exists to break).
     if _db_opens_cleanly(db_path) is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
         return report
 
     if backup:
-        bpath = _backup_db_file(db_path)
+        bpath, backup_error = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None
+        if bpath is None:
+            # HARD STOP (#69603): every strategy below mutates the damaged
+            # file in place (FTS rebuild, REINDEX, writable_schema surgery,
+            # VACUUM). Without the pre-repair backup, the damaged DB is the
+            # only copy of the user's data — a failed or interrupted repair
+            # would then be unrecoverable. Abort and surface the reason
+            # instead of proceeding fail-open.
+            report["error"] = (
+                "pre-repair backup refused; aborting schema repair to avoid "
+                f"mutating the only copy of the damaged DB: {backup_error}"
+            )
+            logger.error("state.db repair aborted: %s", report["error"])
+            return report
 
     # ── Strategy 0: rebuild FTS indexes in place (FTS write-corruption) ──
     # The FTS5 'rebuild' command rewrites the internal index from the canonical
@@ -1439,6 +2107,8 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                     "WHERE type IS ? AND name IS ? AND rowid <> ?",
                     (type_, name, keep),
                 )
+            if dupes:
+                _bump_schema_cookie(conn)
             conn.execute("PRAGMA writable_schema=OFF")
             conn.commit()
         finally:
@@ -1460,6 +2130,7 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         try:
             conn.execute("PRAGMA writable_schema=ON")
             conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
+            _bump_schema_cookie(conn)
             conn.execute("PRAGMA writable_schema=OFF")
             conn.commit()
             conn.execute("VACUUM")
@@ -1839,6 +2510,184 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             handle.close()
 
 
+# ── Read-only health/stats probes (hermes doctor, dashboards) ──────────
+
+
+def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
+    """Best-effort, strictly read-only stats snapshot of a state.db file.
+
+    Opens the database with ``mode=ro`` (URI) and a short timeout so it can
+    run against a *live* database held by a gateway without ever taking a
+    write lock or mutating the file. Every field is collected independently:
+    a failed pragma/SELECT yields ``None`` for that field, and the helper
+    itself never raises.
+
+    Deliberately does NOT instantiate :class:`SessionDB` — its constructor
+    runs schema DDL (migrations, FTS table creation), which is exactly the
+    kind of write a diagnostics probe must never perform.
+
+    Returned keys (all present, any may be None on failure):
+
+    - ``page_count``, ``page_size``, ``freelist_count`` — PRAGMA values
+    - ``logical_size_bytes`` — page_count * page_size (post-checkpoint size)
+    - ``wal_size_bytes`` — stat() of ``<db>-wal`` (0 when absent)
+    - ``journal_mode`` — PRAGMA journal_mode string
+    - ``messages`` / ``sessions`` — row counts
+    - ``fts_tables`` — dict of {table_name: bool} presence for
+      messages_fts / messages_fts_trigram / messages_fts_cjk
+    - ``fts_storage_version`` — int from state_meta, None when the marker is
+      absent (legacy pre-v23 inline layout)
+    - ``fts_rebuild_pending`` — True when the deferred v23 backfill has not
+      finished (high_water present and progress < high_water)
+    - ``fts_rebuild_high_water`` / ``fts_rebuild_progress`` — raw ints
+    """
+    stats: Dict[str, Any] = {
+        "page_count": None,
+        "page_size": None,
+        "freelist_count": None,
+        "logical_size_bytes": None,
+        "wal_size_bytes": None,
+        "journal_mode": None,
+        "messages": None,
+        "sessions": None,
+        "fts_tables": None,
+        "fts_storage_version": None,
+        "fts_rebuild_pending": None,
+        "fts_rebuild_high_water": None,
+        "fts_rebuild_progress": None,
+    }
+
+    # WAL sidecar size needs no connection at all.
+    try:
+        wal_path = Path(str(db_path) + "-wal")
+        stats["wal_size_bytes"] = wal_path.stat().st_size if wal_path.exists() else 0
+    except OSError:
+        pass
+
+    conn = None
+    try:
+        # mode=ro refuses to create the file and refuses every write; a
+        # short timeout keeps doctor snappy when a writer holds the lock.
+        # Route through the tracked connect so byte-probe helpers
+        # (read_header_bytes_preopen) see this connection and refuse raw
+        # opens that could cancel our POSIX locks mid-read.
+        conn = _connect_tracked_db(
+            f"file:{Path(db_path)}?mode=ro",
+            tracking_path=Path(db_path),
+            uri=True,
+            timeout=2.0,
+        )
+    except Exception as exc:
+        logger.debug("collect_state_db_stats: cannot open %s read-only: %s",
+                     db_path, exc)
+        return stats
+
+    def _scalar(sql: str) -> Any:
+        try:
+            row = conn.execute(sql).fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    try:
+        pc = _scalar("PRAGMA page_count")
+        ps = _scalar("PRAGMA page_size")
+        stats["page_count"] = int(pc) if pc is not None else None
+        stats["page_size"] = int(ps) if ps is not None else None
+        if stats["page_count"] is not None and stats["page_size"] is not None:
+            stats["logical_size_bytes"] = stats["page_count"] * stats["page_size"]
+
+        fl = _scalar("PRAGMA freelist_count")
+        stats["freelist_count"] = int(fl) if fl is not None else None
+
+        jm = _scalar("PRAGMA journal_mode")
+        stats["journal_mode"] = str(jm) if jm is not None else None
+
+        msgs = _scalar("SELECT COUNT(*) FROM messages")
+        stats["messages"] = int(msgs) if msgs is not None else None
+        sess = _scalar("SELECT COUNT(*) FROM sessions")
+        stats["sessions"] = int(sess) if sess is not None else None
+
+        # FTS table presence via sqlite_master (never SELECTs from the
+        # virtual tables themselves — a corrupt index must not fail stats).
+        try:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN (?, ?, ?)",
+                    ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"),
+                ).fetchall()
+            }
+            stats["fts_tables"] = {
+                t: (t in names)
+                for t in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
+            }
+        except Exception:
+            pass
+
+        # Raw state_meta reads — cheap, and independent of SessionDB.
+        def _meta_int(key: str) -> Optional[int]:
+            try:
+                row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?", (key,)
+                ).fetchone()
+                return int(row[0]) if row and row[0] is not None else None
+            except Exception:
+                return None
+
+        stats["fts_storage_version"] = _meta_int("fts_storage_version")
+        high_water = _meta_int("fts_rebuild_high_water")
+        progress = _meta_int("fts_rebuild_progress")
+        stats["fts_rebuild_high_water"] = high_water
+        stats["fts_rebuild_progress"] = progress
+        if high_water is None:
+            stats["fts_rebuild_pending"] = False
+        else:
+            stats["fts_rebuild_pending"] = (progress or 0) < high_water
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return stats
+
+
+def count_db_holders(db_path: Path) -> Optional[int]:
+    """Best-effort count of processes holding ``db_path`` open (Linux only).
+
+    Scans ``/proc/*/fd`` symlinks for the resolved database path. Returns
+    the number of distinct PIDs with the file open, or ``None`` on any
+    error or on non-Linux platforms. Never raises; no lsof dependency.
+    Unreadable per-process fd dirs (other users' processes without root)
+    are silently skipped, so the count is a lower bound.
+    """
+    try:
+        if not sys.platform.startswith("linux"):
+            return None
+        target = os.path.realpath(str(db_path))
+        holders = 0
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            fd_dir = f"/proc/{pid}/fd"
+            try:
+                fds = os.listdir(fd_dir)
+            except OSError:
+                continue  # process gone or not ours
+            for fd in fds:
+                try:
+                    if os.readlink(f"{fd_dir}/{fd}") == target:
+                        holders += 1
+                        break  # one hit per PID
+                except OSError:
+                    continue
+        return holders
+    except Exception:
+        return None
+
+
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
@@ -1956,23 +2805,64 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
+        # Fail hard (before any connection/pragma/mkdir) if a pytest-context
+        # process resolved the developer's production state.db — see the
+        # live-DB test-isolation guard block near _default_db_path().
+        _ensure_test_isolation(self.db_path)
         self.read_only = read_only
 
         self._lock = threading.Lock()
-        # Read-path split (WAL only): recall/browse queries run on per-thread
-        # read-only connections so they never queue behind writer flushes on
-        # self._lock. See _read_ctx().
-        self._read_local = threading.local()
-        # Strong set of all live read connections across all threads.  We
-        # hold a reference so short-lived reader threads' connections are
-        # not GC'd without close() — that would leak tracked fds in
-        # _live_connections.  close() drains this set.
-        self._read_conns: "set[sqlite3.Connection]" = set()
+        # Read-path split (WAL only): recall/browse queries borrow a
+        # read-only connection from a bounded pool so they never queue
+        # behind writer flushes on self._lock. See _read_ctx().
+        #
+        # The pool is BOUNDED because the previous per-thread
+        # (threading.local + strong set) scheme pinned one connection per
+        # (SessionDB x thread) for the life of the process. Starlette
+        # dispatches sync routes on anyio worker threads, so a SessionDB
+        # that is never closed accumulated a connection — and two fds, the
+        # database and its -wal — for every worker thread that ever read,
+        # until the process hit the 256 soft RLIMIT_NOFILE a service manager
+        # hands it and every request failed with EMFILE while the process
+        # stayed alive, so the supervisor's restart-on-exit never fired.
+        # Same bug class as the closing(...) fix in gateway/readiness.py
+        # (#69678 / #69567).
+        self._read_pool: "queue.LifoQueue[sqlite3.Connection]" = queue.LifoQueue(
+            maxsize=_READ_POOL_MAX
+        )
+        # One permit per live read connection, held from before the open in
+        # _get_read_conn() until after the close in _close_read_conn().  This
+        # is what bounds PEAK descriptors; _read_pool alone bounds only the
+        # idle set.  See _READ_POOL_MAX.  Acquired non-blocking on purpose: a
+        # reader that cannot get a permit must degrade to the writer lock, not
+        # queue here — blocking would convert fd exhaustion into a stall, which
+        # is the same outage with a different stack trace.
+        self._read_permits = threading.BoundedSemaphore(_READ_POOL_MAX)
+        # Count of reads that found no permit and fell back to the locked
+        # writer connection. Not load-bearing; it is the only externally
+        # visible signal that the ceiling is actually being reached, so a
+        # too-small _READ_POOL_MAX is diagnosable from a running process
+        # instead of inferred from latency.
+        self._read_permit_exhausted = 0
         self._read_conns_lock = threading.Lock()
-        # Set when close() begins.  _get_read_conn checks this under the
-        # lock so a reader that finishes opening after the drain finds the
-        # shutdown in progress and closes its own connection immediately.
+        # Set when close() begins.  _read_ctx checks this under the lock
+        # before returning a connection to the pool, so a reader still in
+        # flight during the drain closes its own connection instead of
+        # re-populating a pool nobody will drain again.
         self._read_conns_closed = False
+        # "read-only opens are failing against this file" backoff stamp.
+        # Instance-wide rather than per-thread: with a shared pool the open
+        # is no longer a per-thread event, and retrying a known-bad open on
+        # every query is a syscall storm for no benefit. The locked writer
+        # connection still serves reads while the backoff holds.
+        # Deliberately a TIMESTAMP, not a sticky bool: the likeliest trigger
+        # is transient fd pressure (EMFILE) — the very condition this pool
+        # exists to prevent — and a permanent flag would demote every reader
+        # on this instance to the writer lock for the life of the process.
+        # The gateway shares one SessionDB across every agent, so that turns
+        # a momentary blip into a permanent global convoy. Expires after
+        # _READ_OPEN_RETRY_SECONDS so the read path self-heals.
+        self._read_open_failed_at = 0.0
         self._wal_active = False
         self._write_count = 0
         # One-shot guard for the runtime FTS rebuild recovery on the write
@@ -1981,10 +2871,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # in place at most once per SessionDB instance so a genuinely
         # unrecoverable database can't put writers into a rebuild loop.
         self._fts_runtime_rebuild_attempted = False
+        # One-shot guard for the runtime connection-reopen recovery on the
+        # write path. A connection whose backing file was replaced/truncated
+        # by a sibling process surfaces as "file is not a database" on every
+        # write; we close and reopen the connection at most once per
+        # SessionDB instance so a genuinely unrecoverable database can't put
+        # writers into a reconnect loop.
+        self._notadb_reconnect_attempted = False
         # One-shot guard for the usermerge-floor config write on the
         # incremental FTS merge cadence (see _merge_fts_incrementally).
         self._fts_usermerge_floor_applied = False
         self._fts_enabled = False
+        self._fts_stale = False
         self._trigram_available = False
         # CJK-bigram index (cjk_unicode61 loadable tokenizer). _fts_cjk_loaded:
         # extension present on the writer connection; _fts_cjk_available: the
@@ -2203,7 +3101,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # ── Read-path split ──
 
     def _get_read_conn(self) -> Optional[sqlite3.Connection]:
-        """Per-thread read-only connection, or None when unavailable.
+        """Open a fresh read-only connection, or None when unavailable.
+
+        Callers must return the connection to self._read_pool (see
+        _read_ctx); this opens, it does not track.
 
         Only used under WAL: WAL readers see a consistent snapshot and never
         block on (or get blocked by) the writer, so recall/browse queries can
@@ -2217,16 +3118,45 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not self._wal_active or self.read_only:
             return None
-        conn = getattr(self._read_local, "conn", None)
-        if conn is not None:
-            return conn
-        if getattr(self._read_local, "failed", False):
+        with self._read_conns_lock:
+            if self._read_conns_closed:
+                return None
+            if (
+                self._read_open_failed_at
+                and time.monotonic() - self._read_open_failed_at
+                < _READ_OPEN_RETRY_SECONDS
+            ):
+                return None
+        # Take the descriptor permit BEFORE the open, so concurrent openers
+        # race for permits rather than for file descriptors. Non-blocking:
+        # losing the race means "use the writer connection", not "wait".
+        if not self._read_permits.acquire(blocking=False):
+            with self._read_conns_lock:
+                self._read_permit_exhausted += 1
+            logger.debug(
+                "read pool at capacity (%d) for %s; serving this read from the "
+                "locked writer connection",
+                _READ_POOL_MAX,
+                self.db_path,
+            )
             return None
+        # Bound before the try: the except handlers close it if the open
+        # half-succeeded, and an unbound name there would raise NameError over
+        # the top of the real failure.
+        conn = None
         try:
             conn = _connect_tracked_db(
                 f"file:{self.db_path}?mode=ro",
                 tracking_path=self.db_path,
                 uri=True,
+                # Pooled connections are borrowed by whichever thread runs
+                # the next read, and sqlite3 otherwise refuses cross-thread
+                # use ("SQLite objects created in a thread can only be used
+                # in that same thread") — including on close(), which is how
+                # the old per-thread connections became unclosable and leaked
+                # their fds. Exclusive ownership is enforced by the pool
+                # checkout/return, not by sqlite3. Matches the writer opens.
+                check_same_thread=False,
                 timeout=5.0,
                 isolation_level=None,
             )
@@ -2238,36 +3168,134 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # registry, not the database file, so mode=ro is fine.
             if self._fts_cjk_loaded:
                 load_fts5_cjk_extension(conn)
-            with self._read_conns_lock:
-                if self._read_conns_closed:
-                    # close() already drained — don't register; close
-                    # immediately so no tracked fd leaks.
-                    conn.close()
-                    self._read_local.failed = True
-                    return None
-                self._read_conns.add(conn)
         except sqlite3.Error:
-            # Mark this thread failed so we don't retry the open on every
-            # query; the locked writer connection still serves reads.
-            self._read_local.failed = True
+            # A partially-constructed connection — _connect_tracked_db
+            # succeeded, the CJK extension load did not — must be closed here.
+            # Dropping it on the floor still open leaves a live descriptor the
+            # tracking registry still counts: the same leak shape this pool
+            # exists to fix, one level further down.
+            self._discard_partial_read_conn(conn)
+            # Back off from retrying the open on every query; the locked
+            # writer connection still serves reads until the stamp expires.
+            with self._read_conns_lock:
+                self._read_open_failed_at = time.monotonic()
             logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
+            self._read_permits.release()
             return None
-        self._read_local.conn = conn
+        except BaseException:
+            # Anything else (a non-sqlite3 extension-load failure, MemoryError,
+            # KeyboardInterrupt landing between open and return) must not
+            # strand the permit: a stranded permit is not a transient error, it
+            # permanently shrinks the read path by one slot for the life of the
+            # process.
+            self._discard_partial_read_conn(conn)
+            self._read_permits.release()
+            raise
         return conn
+
+    def _discard_partial_read_conn(self, conn) -> None:
+        """Close a connection that failed between open and hand-off.
+
+        Separate from _close_read_conn because that one releases a permit and
+        this runs on paths that release their own.
+        """
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception as exc:
+            logger.warning(
+                "partially-opened read conn close failed for %s: %s", self.db_path, exc
+            )
+
+    def _close_read_conn(self, conn) -> None:
+        """Close a pooled read connection and release its descriptor permit.
+
+        This was a bare ``except Exception: pass``, which silently swallowed
+        the sqlite3.ProgrammingError raised when close() ran on a thread
+        other than the one that opened the connection — the exact signature
+        of the fd leak this pool fixes. A close that fails leaks a tracked
+        fd, so it must not be invisible.
+
+        The permit is released even when close() raises: the descriptor is
+        already lost at that point, and withholding the permit too would turn
+        one leaked fd into a permanently narrower read path — failing twice for
+        one fault. The warning is the signal that matters.
+
+        Pairs with _get_read_conn(). Calling this on a connection that did not
+        come from there over-releases the BoundedSemaphore, which raises
+        ValueError rather than silently widening the ceiling.
+        """
+        try:
+            conn.close()
+        except Exception as exc:
+            logger.warning("read-conn close failed for %s: %s", self.db_path, exc)
+        finally:
+            self._read_permits.release()
+
+    def _checkout_read_conn(self) -> Optional[sqlite3.Connection]:
+        """Borrow a read connection from the pool, opening one on a miss.
+
+        The single acquisition seam for the read path: the WAL/read_only gate,
+        the pool checkout and the open-on-miss all live here, so there is
+        exactly one place to exercise (and one place for a caller to bypass by
+        accident). Returns None when the read path is unavailable and the
+        caller must fall back to the locked writer connection.
+
+        A pool hit costs no permit — the connection it hands back is already
+        holding one. Only the miss path can open, and only _get_read_conn() can
+        take a permit, so peak live connections is bounded by _READ_POOL_MAX no
+        matter how many threads miss simultaneously.
+        """
+        if not self._wal_active or self.read_only:
+            return None
+        try:
+            return self._read_pool.get_nowait()
+        except queue.Empty:
+            return self._get_read_conn()
 
     @contextmanager
     def _read_ctx(self):
         """Yield a connection for read-only statements.
 
-        WAL: a per-thread read-only connection with NO lock — recall queries
-        never convoy behind writer flushes (the gateway shares one SessionDB
-        across every agent, so this lock was a global choke point).
-        Non-WAL or read-conn failure: the shared writer connection under
-        self._lock, byte-for-byte the legacy behavior.
+        WAL: a read-only connection borrowed from a bounded pool with NO
+        lock — recall queries never convoy behind writer flushes (the
+        gateway shares one SessionDB across every agent, so this lock was a
+        global choke point). The connection is checked out for the duration
+        of the block, so no two threads ever touch it concurrently.
+        Non-WAL, read-conn failure, or _READ_POOL_MAX already reached: the
+        shared writer connection under self._lock, byte-for-byte the legacy
+        behavior.
+
+        That last case is the deliberate degradation. Past the ceiling readers
+        convoy on the writer lock instead of opening descriptors — measurably
+        slower under a burst, and the alternative is EMFILE, which takes the
+        whole process down in a way a restart-on-exit supervisor cannot see.
         """
-        conn = self._get_read_conn()
+        conn = self._checkout_read_conn()
         if conn is not None:
-            yield conn
+            try:
+                yield conn
+            finally:
+                returned = False
+                with self._read_conns_lock:
+                    if not self._read_conns_closed:
+                        try:
+                            self._read_pool.put_nowait(conn)
+                            returned = True
+                        except queue.Full:
+                            pass
+                if not returned:
+                    # close() has already drained the pool, so this connection
+                    # is surplus. Close it here — dropping it on the floor is
+                    # what leaked the fd.
+                    #
+                    # queue.Full is now unreachable in practice (permits and
+                    # maxsize are both _READ_POOL_MAX, so there can never be a
+                    # ninth connection to return), but the branch stays: it is
+                    # load-bearing if those two ever drift apart, and a leak is
+                    # the failure mode it prevents.
+                    self._close_read_conn(conn)
             return
         with self._lock:
             yield self._conn
@@ -2619,18 +3647,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.DatabaseError as exc:
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
+                # Runtime connection-corruption self-heal: a connection whose
+                # backing file was replaced/truncated by a sibling process
+                # (e.g. a forked curator agent inheriting and closing the
+                # write fd, or an external repair pass) surfaces as "file is
+                # not a database" on EVERY subsequent write. Without a
+                # reconnect branch the gateway wedges permanently: every
+                # transcript/routing write raises, messages stay in memory,
+                # and swap grows without bound until the process is killed.
+                # Close the broken connection, reopen the DB file, and retry
+                # the write once.
+                if _is_not_a_database_error(exc):
+                    if not self._reconnect_after_notadb():
+                        raise
+                    continue
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
-                # while the canonical messages table is intact. The gateway
-                # session store has its own retry queue for transcript
-                # appends (#65637 salvage), but cron and CLI writers call
-                # SessionDB directly — without this, their writes hard-fail
-                # until the next process restart triggers the offline repair.
-                # Rebuild the FTS index in place (once per instance) via
-                # rebuild_fts() and retry the failed write immediately.
-                if not self._try_runtime_fts_rebuild(exc):
-                    raise
-                continue
+                # while the canonical messages table is intact. Recover here,
+                # at the shared persistence boundary, so every caller gets the
+                # same guarantee. First try the cheap in-place repair. If that
+                # one-shot path is unavailable or corruption recurs, detach the
+                # derived indexes and retry against the canonical tables.
+                if self._try_runtime_fts_rebuild(exc):
+                    continue
+                if self._enter_fts_fail_open(exc):
+                    continue
+                raise
             except sqlite3.Error as exc:
                 # Catch-all for builds that surface 'no more rows available'
                 # as InterfaceError (a sibling of DatabaseError, not a
@@ -2667,6 +3709,64 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._WRITE_RETRY_MAX_S,
             )
         time.sleep(min(jitter, max(deadline - now, 0.001)))
+        return True
+
+    def _reconnect_after_notadb(self) -> bool:
+        """Close the corrupted write connection and reopen state.db.
+
+        Returns True when the connection was successfully replaced and the
+        failed write should be retried.  Mirrors the constructor's
+        ``_connect_and_init`` so WAL/schema reconciliation runs on the fresh
+        connection.  Never raises — logs and returns False on failure so the
+        original error propagates.
+
+        One-shot per instance: a genuinely unrecoverable database must not
+        put writers into a reconnect loop that pins CPU on every write.
+        """
+        if self._notadb_reconnect_attempted:
+            return False
+        self._notadb_reconnect_attempted = True
+        logger.warning(
+            "state.db connection reported 'file is not a database' — closing "
+            "and reopening the connection to self-heal (one-shot)."
+        )
+        try:
+            with self._lock:
+                if self._conn is not None:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+                new_conn = _connect_tracked_db(
+                    str(self.db_path),
+                    tracking_path=self.db_path,
+                    check_same_thread=False,
+                    timeout=1.0,
+                    isolation_level=None,
+                )
+                new_conn.row_factory = sqlite3.Row
+                # Publish BEFORE schema init: _init_schema/_reconcile_columns
+                # operate on self._conn, not on the local variable.
+                self._conn = new_conn
+                self._wal_active = (
+                    apply_wal_with_fallback(new_conn, db_label="state.db")
+                    == "wal"
+                )
+                apply_database_pragmas(new_conn, db_label="state.db")
+                new_conn.execute("PRAGMA foreign_keys=ON")
+                self._fts_cjk_loaded = load_fts5_cjk_extension(new_conn)
+                self._init_schema()
+        except Exception as exc:
+            logger.error(
+                "state.db reconnect after 'file is not a database' failed (%s); "
+                "the database may need the full offline repair path.",
+                exc,
+            )
+            return False
+        logger.warning(
+            "state.db connection reopened successfully; retrying the failed write."
+        )
         return True
 
     @staticmethod
@@ -2734,6 +3834,63 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         return True
 
+    def _enter_fts_fail_open(self, exc: sqlite3.DatabaseError) -> bool:
+        """Detach corrupt FTS indexes so canonical writes can continue.
+
+        The stale breadcrumb and trigger removal commit atomically. Its
+        ordering is load-bearing: after triggers are absent, new canonical
+        rows create an index gap of unknown extent, so another process must
+        never reinstall the triggers without first rebuilding every row.
+        """
+        if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
+            return False
+
+        try:
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._conn.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (FTS_STALE_KEY,),
+                    )
+                    cjk_triggers_present = self._conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
+                        "LIMIT 1",
+                        _FTS_CJK_TRIGGERS,
+                    ).fetchone()
+                    if cjk_triggers_present:
+                        self._conn.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (FTS_CJK_STALE_KEY,),
+                        )
+                    self._drop_all_fts_triggers(self._conn.cursor())
+                    self._conn.commit()
+                except BaseException:
+                    self._conn.rollback()
+                    raise
+        except sqlite3.Error as detach_exc:
+            logger.error(
+                "Could not detach corrupt FTS indexes; canonical write still "
+                "cannot proceed: %s",
+                detach_exc,
+            )
+            return False
+
+        self._fts_stale = True
+        self._fts_enabled = False
+        self._trigram_available = False
+        self._fts_cjk_available = False
+        logger.error(
+            "state.db FTS indexes remain corrupt (%s); disabled FTS sync and "
+            "retrying the canonical write. Search temporarily uses LIKE until "
+            "a later SessionDB open rebuilds the indexes.",
+            exc,
+        )
+        return True
+
     def _try_wal_checkpoint(self) -> None:
         """Best-effort PASSIVE WAL checkpoint.  Never raises.
 
@@ -2743,9 +3900,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cannot corrupt B-tree pages under I/O pressure.
 
         PASSIVE does not truncate the WAL file — it stays at its
-        high-water mark.  WAL truncation happens in :meth:`close`
-        (TRUNCATE) and pre-VACUUM checkpoints, which run infrequently
-        under controlled conditions.
+        high-water mark. Explicit checkpoints on the shared ``state.db`` no
+        longer truncate the WAL; it is bounded by ``journal_size_limit`` and
+        the writer's natural post-checkpoint reset rather than by a TRUNCATE
+        at every close or maintenance command.
 
         Previous TRUNCATE strategy caused B-tree corruption on large
         databases (65K+ pages) due to the exclusive-lock I/O pressure
@@ -2768,9 +3926,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Close the database connection.
 
         Drains queued token deltas first (the background writer needs the
-        connection). Writable connections then attempt a TRUNCATE WAL
-        checkpoint so exiting writer processes help shrink the WAL file.
-        Read-only connections never request a checkpoint.
+        connection). Writable connections then attempt a PASSIVE WAL
+        checkpoint (NOT TRUNCATE: transient per-cron-run connections close
+        many times an hour, and a TRUNCATE fires a full WAL reset that
+        races the gateway's live writer and tears B-tree pages — issue
+        #45383). Read-only connections never request a checkpoint.
         """
         self._stop_token_writer()
         # The atexit hook holds a strong reference to this instance (bound
@@ -2779,31 +3939,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # (instance, function), so this removes exactly our registration;
         # no-op when the writer never started.
         atexit.unregister(self._drain_token_queue_at_exit)
-        # Close all read-only connections across all threads.  Per-thread
-        # connections live in threading.local() and would otherwise be GC'd
-        # without calling close(), leaking tracked fds in _live_connections.
-        # The strong set holds references so short-lived reader threads'
-        # connections survive until close() drains them.  Setting the closed
-        # flag under the lock prevents a reader from registering a new
-        # connection after the drain.
+        # Drain the read-only connection pool.  Setting the closed flag
+        # under the lock first means a reader still in flight closes its own
+        # connection on release instead of re-populating a pool that has
+        # already been drained.
         with self._read_conns_lock:
             self._read_conns_closed = True
-            read_conns = list(self._read_conns)
-            self._read_conns.clear()
-        for conn in read_conns:
+        while True:
             try:
-                conn.close()
-            except Exception:
-                pass
-        self._read_local.conn = None
+                conn = self._read_pool.get_nowait()
+            except queue.Empty:
+                break
+            self._close_read_conn(conn)
         with self._lock:
             if self._conn:
                 if not self.read_only:
+                    # PASSIVE, not TRUNCATE. Every cron run_agent opens+closes a
+                    # transient SessionDB, so a TRUNCATE here fires a full WAL
+                    # reset many times/hour, racing the gateway's long-lived
+                    # writer on large WAL databases and tearing hot B-tree
+                    # pages -- the #45383 corruption this class's own periodic
+                    # checkpoint was already made PASSIVE to avoid. TRUNCATE
+                    # belongs only on a sole-opener/quiescent connection.
                     try:
-                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug(
-                            "WAL checkpoint (TRUNCATE) at close failed: %s",
+                            "WAL checkpoint (PASSIVE) at close failed: %s",
                             exc,
                         )
                 self._conn.close()
@@ -2896,6 +4058,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cwd: str = None,
         profile_name: str = None,
         git_repo_root: str = None,
+        origin_json: str = None,
+        display_name: str = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -2938,12 +4102,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
                    model, model_config, system_prompt, system_prompt_hash,
-                   parent_session_id, cwd, profile_name, git_repo_root, started_at
+                   parent_session_id, cwd, profile_name, git_repo_root,
+                   origin_json, display_name, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
-                       model_config = COALESCE(sessions.model_config, excluded.model_config),
+                       model_config = CASE
+                           WHEN excluded.model_config IS NOT NULL
+                                AND json_type(
+                                    sessions.model_config, '$._reset_from'
+                                ) IS NOT NULL
+                                AND json_remove(
+                                    sessions.model_config, '$._reset_from'
+                                ) = '{}'
+                           THEN json_set(
+                               excluded.model_config,
+                               '$._reset_from',
+                               json_extract(
+                                   sessions.model_config, '$._reset_from'
+                               )
+                           )
+                           ELSE COALESCE(
+                               sessions.model_config, excluded.model_config
+                           )
+                       END,
                        system_prompt_hash = COALESCE(
                            sessions.system_prompt_hash,
                            excluded.system_prompt_hash
@@ -2961,7 +4144,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
                        cwd = COALESCE(sessions.cwd, excluded.cwd),
                        profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
-                       git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root)""",
+                       git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root),
+                       origin_json = COALESCE(sessions.origin_json, excluded.origin_json),
+                       display_name = COALESCE(sessions.display_name, excluded.display_name)""",
                 (
                     session_id,
                     source,
@@ -2977,6 +4162,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     cwd,
                     profile_name,
                     git_repo_root,
+                    origin_json,
+                    display_name,
                     time.time(),
                 ),
             )
@@ -3078,6 +4265,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         on one routing peer when an explicit gateway resume moves its tip to a
         different lane. Normal per-turn metadata refreshes update only the
         supplied row.
+
+        Self-healing (#82616): when the target row does not exist yet — the
+        gateway's ``create_session`` write failed and was deferred, or a
+        crash landed between routing publication and row creation — this
+        recorder INSERTs the row with the full identity instead of silently
+        no-opping. Every per-turn peer refresh is therefore a repair
+        opportunity: a gateway session row can no longer be first-created by
+        an identity-less lazy writer (``update_token_counts`` /
+        ``record_auxiliary_usage``) and stay unroutable forever.
         """
         if not session_id or not session_key:
             return
@@ -3133,6 +4329,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    {target_clause}""",
                 query_params,
             )
+            # Self-heal (#82616): the UPDATE is a silent no-op when the row
+            # is missing (create_session failed earlier, or a crash landed
+            # between routing publication and row creation). Insert it with
+            # the full identity so the session is durably routable — never
+            # leave first-creation to an identity-less lazy writer.
+            if not include_compression_ancestors:
+                cur = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+                )
+                if cur.fetchone() is None:
+                    conn.execute(
+                        """INSERT INTO sessions (
+                               id, source, user_id, session_key, chat_id,
+                               chat_type, thread_id, display_name, origin_json,
+                               started_at
+                           )
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(id) DO UPDATE SET
+                               session_key = COALESCE(sessions.session_key, excluded.session_key),
+                               chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
+                               chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
+                               thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
+                               display_name = COALESCE(sessions.display_name, excluded.display_name),
+                               origin_json = COALESCE(sessions.origin_json, excluded.origin_json)""",
+                        (
+                            session_id,
+                            source,
+                            user_id,
+                            session_key,
+                            chat_id,
+                            chat_type,
+                            thread_id,
+                            display_name,
+                            origin_json,
+                            time.time(),
+                        ),
+                    )
 
         self._execute_write(_do)
 
@@ -3341,24 +4574,53 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (dashboard viewer disconnect before #60609) are treated as recoverable;
         explicit conversation boundaries such as /new, /resume switches, and
         compression splits are not.
+
+        Ordering and emptiness (#82616): candidates are ranked by actual
+        conversation recency (``last_activity_at``, falling back to
+        ``started_at``) — ``started_at`` alone resurrected days-old zombie
+        rows over the live conversation. Rows with messages are preferred,
+        but an empty keyed row is still returned rather than ``None``:
+        returning ``None`` mints a brand-new session id, which is a worse
+        outcome than resuming an empty-but-correctly-keyed row (and "empty"
+        may just mean the transcript lives under a compression child).
+
+        Reset boundaries fence recovery (#68539): an intentional boundary
+        such as ``session_reset`` (or any explicit non-recoverable
+        end_reason) must block fallback to an *older* row for the same
+        peer. Without the fence, the has-messages ranking above could reach
+        behind a /new reset and silently restore the exact context the user
+        reset. Each candidate is therefore rejected when a boundary row for
+        the peer ended *after* the candidate's last activity — if the
+        conversation's most recent event is an intentional reset, recovery
+        returns nothing rather than reaching behind it.
         """
         if not session_key:
             return None
         with self._lock:
             row = self._conn.execute(
-                """
+                f"""
                 SELECT s.*,
                        COALESCE(sp.prompt, s.system_prompt)
-                           AS _system_prompt_resolved
+                           AS _system_prompt_resolved,
+                       (COALESCE(s.message_count, 0) > 0 OR EXISTS (
+                           SELECT 1 FROM messages WHERE messages.session_id = s.id LIMIT 1
+                       )) AS _has_messages
                 FROM sessions s
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
                 WHERE s.session_key = ?
                   AND s.source = ?
                   AND (s.ended_at IS NULL OR s.end_reason IN ('agent_close', 'ws_orphan_reap'))
-                  AND (COALESCE(s.message_count, 0) > 0 OR EXISTS (
-                      SELECT 1 FROM messages WHERE messages.session_id = s.id LIMIT 1
-                  ))
-                ORDER BY s.started_at DESC
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sessions b
+                      WHERE b.session_key = s.session_key
+                        AND b.source = s.source
+                        AND b.ended_at IS NOT NULL
+                        AND b.end_reason IN ({_RESET_END_REASONS_SQL})
+                        AND b.ended_at
+                            > COALESCE(s.last_activity_at, s.started_at)
+                  )
+                ORDER BY _has_messages DESC,
+                         COALESCE(s.last_activity_at, s.started_at) DESC
                 LIMIT 1
                 """,
                 (session_key, source),
@@ -3372,10 +4634,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if chat_id is None or chat_type is None:
                 return None
             row = self._conn.execute(
-                """
+                f"""
                 SELECT s.*,
                        COALESCE(sp.prompt, s.system_prompt)
-                           AS _system_prompt_resolved
+                           AS _system_prompt_resolved,
+                       (COALESCE(s.message_count, 0) > 0 OR EXISTS (
+                           SELECT 1 FROM messages WHERE messages.session_id = s.id LIMIT 1
+                       )) AS _has_messages
                 FROM sessions s
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
                 WHERE s.source = ?
@@ -3387,12 +4652,271 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                   AND (COALESCE(s.message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = s.id LIMIT 1
                   ))
-                ORDER BY s.started_at DESC
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sessions b
+                      WHERE b.source = s.source
+                        AND COALESCE(b.user_id, '') = COALESCE(s.user_id, '')
+                        AND COALESCE(b.chat_id, '') = COALESCE(s.chat_id, '')
+                        AND COALESCE(b.chat_type, '') = COALESCE(s.chat_type, '')
+                        AND COALESCE(b.thread_id, '') = COALESCE(s.thread_id, '')
+                        AND b.ended_at IS NOT NULL
+                        AND b.end_reason IN ({_RESET_END_REASONS_SQL})
+                        AND b.ended_at
+                            > COALESCE(s.last_activity_at, s.started_at)
+                  )
+                ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC
                 LIMIT 1
                 """,
                 (source, user_id, chat_id, chat_type, thread_id),
             ).fetchone()
         return self._session_row_dict(row) if row else None
+
+    # ── Orphaned gateway-session repair (#82616) ──────────────────────────
+    # A write-path failure (corrupt FTS, crash between routing publication
+    # and row creation) can leave the live conversation in a session row
+    # that never received its identity columns. Both queries above require
+    # those columns, so the row holding the real transcript is invisible to
+    # recovery: the chat resolves to the last keyed row instead — days older
+    # — and the conversation time-travels. Hardening the write side cannot
+    # reach a row that is *already* damaged; these two methods are the
+    # offline repair path behind ``hermes sessions repair-routing``.
+
+    # Widest plausible gap between a keyed predecessor going quiet and its
+    # unkeyed successor being minted. The reported incident gap was ~60s;
+    # 15 minutes stays generous without spanning unrelated conversations.
+    _ORPHAN_ADOPTION_MAX_GAP_S = 900.0
+
+    def find_orphaned_gateway_sessions(
+        self, *, max_gap_s: Optional[float] = None
+    ) -> List[Dict[str, Any]]:
+        """Report message-bearing session rows that lost their routing identity.
+
+        A row is a candidate orphan when it has messages but no
+        ``session_key``. It is only *adoptable* when exactly one keyed
+        predecessor can be named as the conversation it continues:
+
+        * ``lineage`` — ``parent_session_id`` points at a keyed row of the
+          same source. That is a recorded fact, so no time window applies.
+        * ``contiguity`` — exactly one keyed row of the same source (and
+          compatible ``user_id``) fell quiet within *max_gap_s* of the
+          orphan's start, and is older than the orphan's own last activity.
+
+        Anything ambiguous is reported with ``adoptable=False`` and a reason
+        rather than guessed at: mis-adopting would splice one person's
+        conversation into another person's chat. Branch/delegate/tool rows
+        are excluded outright — they are unkeyed by design, not by damage.
+        """
+        gap = (
+            self._ORPHAN_ADOPTION_MAX_GAP_S
+            if max_gap_s is None
+            else float(max_gap_s)
+        )
+        orphan_active = _sql_session_last_active("o")
+        donor_active = _sql_session_last_active("d")
+        donor_columns = (
+            "d.id, d.session_key, d.chat_id, d.chat_type, d.thread_id, "
+            "d.user_id, d.origin_json, d.display_name, d.end_reason"
+        )
+        records: List[Dict[str, Any]] = []
+
+        with self._lock:
+            orphans = self._conn.execute(
+                f"""
+                SELECT o.id, o.source, o.user_id, o.started_at,
+                       o.parent_session_id,
+                       {orphan_active} AS last_active,
+                       (SELECT COUNT(*) FROM messages m
+                         WHERE m.session_id = o.id) AS message_count
+                FROM sessions o
+                WHERE o.session_key IS NULL
+                  AND EXISTS (SELECT 1 FROM messages m
+                               WHERE m.session_id = o.id)
+                  AND COALESCE(o.source, '') != 'tool'
+                  AND json_extract(COALESCE(o.model_config, '{{}}'),
+                                   '$._branched_from') IS NULL
+                  AND json_extract(COALESCE(o.model_config, '{{}}'),
+                                   '$._delegate_from') IS NULL
+                ORDER BY o.started_at ASC
+                """
+            ).fetchall()
+
+            for orphan in orphans:
+                donor = None
+                evidence = ""
+                reason = ""
+
+                if orphan["parent_session_id"]:
+                    evidence = "lineage"
+                    donor = self._conn.execute(
+                        f"""
+                        SELECT {donor_columns}
+                        FROM sessions d
+                        WHERE d.id = ?
+                          AND d.session_key IS NOT NULL
+                          AND COALESCE(d.source, '') = COALESCE(?, '')
+                        """,
+                        (orphan["parent_session_id"], orphan["source"]),
+                    ).fetchone()
+                    if donor is None:
+                        reason = (
+                            "parent session carries no gateway identity of "
+                            "this source"
+                        )
+                else:
+                    evidence = "contiguity"
+                    candidates = self._conn.execute(
+                        f"""
+                        SELECT {donor_columns}, {donor_active} AS last_active
+                        FROM sessions d
+                        WHERE d.session_key IS NOT NULL
+                          AND d.id != ?
+                          AND COALESCE(d.source, '') = COALESCE(?, '')
+                          AND (COALESCE(d.user_id, '') = ''
+                               OR COALESCE(?, '') = ''
+                               OR d.user_id = ?)
+                          AND {donor_active} BETWEEN ? AND ?
+                          AND {donor_active} < ?
+                        ORDER BY last_active DESC
+                        LIMIT 2
+                        """,
+                        (
+                            orphan["id"],
+                            orphan["source"],
+                            orphan["user_id"],
+                            orphan["user_id"],
+                            (orphan["started_at"] or 0) - gap,
+                            (orphan["started_at"] or 0) + gap,
+                            orphan["last_active"],
+                        ),
+                    ).fetchall()
+                    if not candidates:
+                        reason = (
+                            f"no keyed predecessor fell quiet within {gap:.0f}s "
+                            "of this session's start"
+                        )
+                    elif len(candidates) > 1:
+                        reason = (
+                            "ambiguous: more than one keyed predecessor "
+                            "matches this window"
+                        )
+                    else:
+                        donor = candidates[0]
+
+                records.append(
+                    {
+                        "orphan_id": orphan["id"],
+                        "source": orphan["source"],
+                        "message_count": orphan["message_count"],
+                        "started_at": orphan["started_at"],
+                        "last_active": orphan["last_active"],
+                        "donor_id": donor["id"] if donor else None,
+                        "session_key": donor["session_key"] if donor else None,
+                        "evidence": evidence if donor else "",
+                        "adoptable": donor is not None,
+                        "reason": reason,
+                    }
+                )
+
+        # Two unkeyed successors claiming the same predecessor means at most
+        # one of them continues that chat, and nothing here says which.
+        contested = {
+            r["donor_id"]
+            for r in records
+            if r["adoptable"]
+            and sum(1 for x in records if x["donor_id"] == r["donor_id"]) > 1
+        }
+        for record in records:
+            if record["donor_id"] in contested:
+                record["adoptable"] = False
+                record["reason"] = (
+                    "ambiguous: more than one unkeyed session claims this "
+                    "predecessor"
+                )
+        return records
+
+    def adopt_orphaned_gateway_session(
+        self, orphan_id: str, donor_id: str
+    ) -> bool:
+        """Stamp *orphan_id* with *donor_id*'s routing identity, retire *donor_id*.
+
+        Re-verifies the pair inside the write transaction, so a concurrent
+        gateway that healed either row in the meantime turns this into a
+        no-op instead of a conflicting write. Existing non-NULL columns on
+        the orphan are preserved. Returns True when the adoption applied.
+        """
+        if not orphan_id or not donor_id or orphan_id == donor_id:
+            return False
+
+        def _do(conn):
+            donor = conn.execute(
+                "SELECT session_key, chat_id, chat_type, thread_id, user_id, "
+                "origin_json, display_name, source FROM sessions WHERE id = ?",
+                (donor_id,),
+            ).fetchone()
+            orphan = conn.execute(
+                "SELECT session_key, source FROM sessions WHERE id = ?",
+                (orphan_id,),
+            ).fetchone()
+            if donor is None or orphan is None:
+                return False
+            if not donor["session_key"] or orphan["session_key"]:
+                return False
+            if (donor["source"] or "") != (orphan["source"] or ""):
+                return False
+
+            conn.execute(
+                """UPDATE sessions
+                      SET session_key = ?,
+                          chat_id = COALESCE(chat_id, ?),
+                          chat_type = COALESCE(chat_type, ?),
+                          thread_id = COALESCE(thread_id, ?),
+                          user_id = COALESCE(user_id, ?),
+                          origin_json = COALESCE(origin_json, ?),
+                          display_name = COALESCE(display_name, ?),
+                          parent_session_id = COALESCE(parent_session_id, ?)
+                    WHERE id = ? AND session_key IS NULL""",
+                (
+                    donor["session_key"],
+                    donor["chat_id"],
+                    donor["chat_type"],
+                    donor["thread_id"],
+                    donor["user_id"],
+                    donor["origin_json"],
+                    donor["display_name"],
+                    donor_id,
+                    orphan_id,
+                ),
+            )
+            # Retire the predecessor under a reason recovery does NOT treat
+            # as resumable — 'agent_close'/'ws_orphan_reap' would keep it in
+            # the running, and the newly keyed orphan could lose the chat
+            # again on the next restart.
+            conn.execute(
+                "UPDATE sessions SET ended_at = COALESCE(ended_at, ?), "
+                "end_reason = 'superseded_by_repair' WHERE id = ?",
+                (time.time(), donor_id),
+            )
+            return True
+
+        return self._execute_write(_do)
+
+    # Children that carry a ``parent_session_id`` but are NOT compression
+    # continuations: branches, delegate/subagent runs, and tool sessions.
+    # A marker only disqualifies a child when it points at the parent being
+    # queried — compression continuations inherit the rotated agent's
+    # ``model_config`` verbatim (``publish_compression_child`` callers pass
+    # ``agent._session_init_model_config``), so a delegate subagent's
+    # continuation carries ``_delegate_from=<the delegate's own parent>``.
+    # Matching markers by mere presence misclassified those real
+    # continuations as delegate children (fail-open for orphan reopen,
+    # fail-closed for adoption). Bind the parent id for both markers.
+    _NON_CONTINUATION_CHILD_FILTER_SQL = (
+        "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
+        " '$._branched_from'), '') != ?\n"
+        "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
+        " '$._delegate_from'), '') != ?\n"
+        "  AND COALESCE({alias}source, '') != 'tool'\n"
+    )
 
     def find_live_compression_child(
         self, parent_session_id: str
@@ -3427,15 +4951,95 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
                 WHERE s.parent_session_id = ?
                   AND s.ended_at IS NULL
-                  AND json_extract(COALESCE(s.model_config, '{}'), '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from') IS NULL
-                  AND COALESCE(s.source, '') != 'tool'
+                """
+                + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="s.")
+                + """
                 ORDER BY s.started_at ASC
                 LIMIT 2
                 """,
-                (parent_session_id,),
+                (parent_session_id, parent_session_id, parent_session_id),
             ).fetchall()
         return self._session_row_dict(rows[0]) if len(rows) == 1 else None
+
+    def reopen_orphaned_compression_session(self, session_id: str) -> bool:
+        """Reopen a compression parent only when no continuation was published.
+
+        Compression publication is atomic in current builds, but older builds
+        could leave a closed parent behind after an interrupted handoff.  This
+        recovery is deliberately conservative: an active compression lease or
+        any canonical child means the lineage is still owned by another path,
+        so the caller must fail closed instead of reopening the parent.
+        """
+        if not session_id:
+            return False
+
+        def _do(conn):
+            parent = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if (
+                parent is None
+                or parent["ended_at"] is None
+                or parent["end_reason"] != "compression"
+            ):
+                return False
+
+            # Treat any direct non-branch/non-delegate/non-tool child as a
+            # continuation, regardless of its current ended state. Reopening
+            # in that case could create a second live head for one lineage.
+            child = conn.execute(
+                """
+                SELECT 1
+                FROM sessions
+                WHERE parent_session_id = ?
+                """
+                + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="")
+                + """
+                LIMIT 1
+                """,
+                (session_id, session_id, session_id),
+            ).fetchone()
+            if child is not None:
+                return False
+
+            # refresh_compression_lock() deliberately lets an owner revive its
+            # own expired row. Reclaim that row inside this write transaction
+            # before reopening: refresh-first makes the lease active and aborts
+            # recovery; recovery-first deletes the holder identity so a later
+            # refresh cannot resurrect it.
+            now = time.time()
+            lock_row = conn.execute(
+                "SELECT holder, expires_at FROM compression_locks "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if lock_row is not None:
+                expires_at = lock_row["expires_at"]
+                if expires_at is None or float(expires_at) >= now:
+                    return False
+                deleted = conn.execute(
+                    "DELETE FROM compression_locks "
+                    "WHERE session_id = ? AND holder = ? AND expires_at = ?",
+                    (session_id, lock_row["holder"], expires_at),
+                )
+                if deleted.rowcount != 1:
+                    return False
+
+            updated = conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                "WHERE id = ? AND ended_at IS NOT NULL "
+                "AND end_reason = 'compression'",
+                (session_id,),
+            )
+            # rowcount==1 is guaranteed by the parent SELECT at the top of
+            # this same BEGIN IMMEDIATE transaction. If this is ever edited
+            # to return False past this point, note that the lease DELETE
+            # above will still COMMIT (_execute_write commits unless _do
+            # raises) — raise instead of returning False to roll back.
+            return updated.rowcount == 1
+
+        return bool(self._execute_write(_do))
 
     def publish_compression_child(
         self,
@@ -3559,8 +5163,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
-        """Clear ended_at/end_reason so a session can be resumed."""
+        """Clear ended_at/end_reason so a session can be resumed.
+
+        Before clearing a reset boundary, stabilize markerless legacy reset
+        children that still depend on the parent's mutable end_reason.
+        """
         def _do(conn):
+            placeholders = ",".join("?" for _ in _RESET_END_REASONS)
+            # WHERE shape shared with _RESET_CHILD_SQL's fallback arm via
+            # _legacy_reset_child_sql so the stamping and the listing
+            # predicate cannot drift.
+            conn.execute(
+                "UPDATE sessions AS child SET model_config = json_set("
+                "COALESCE(child.model_config, '{}'), '$._reset_from', "
+                "child.parent_session_id) "
+                "WHERE child.parent_session_id = ? "
+                "AND json_extract(COALESCE(child.model_config, '{}'), "
+                "                 '$._reset_from') IS NULL "
+                f"AND {_legacy_reset_child_sql('child', placeholders)}",
+                (session_id, *_RESET_END_REASONS),
+            )
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
@@ -3617,7 +5239,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
     def update_session_cwd(
-        self, session_id: str, cwd: str, git_branch: str = None, git_repo_root: str = None
+        self,
+        session_id: str,
+        cwd: str,
+        git_branch: str = None,
+        git_repo_root: str = None,
+        replace_git_meta: bool = False,
     ) -> None:
         """Persist the session working directory when a frontend knows it.
 
@@ -3632,6 +5259,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         every surface reads the same membership instead of re-probing git in the
         GUI over a partial page. Each field is only written when non-empty so a
         probe failure never clobbers a previously-captured value.
+
+        ``replace_git_meta`` inverts that non-empty rule: a deliberate workspace
+        MOVE (re-homing a session into another project) must overwrite the old
+        repo identity even when the new cwd resolves to none — keeping the stale
+        root would leave the session grouped under the project it just left.
         """
         if not session_id or not cwd:
             return
@@ -3641,12 +5273,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         sets = ["cwd = ?"]
         params: List[Any] = [cwd]
-        if branch:
+        if branch or replace_git_meta:
             sets.append("git_branch = ?")
-            params.append(branch)
-        if repo_root:
+            params.append(branch or None)
+        if repo_root or replace_git_meta:
             sets.append("git_repo_root = ?")
-            params.append(repo_root)
+            params.append(repo_root or None)
         params.append(session_id)
 
         def _do(conn):
@@ -4270,7 +5902,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
-    def update_session_model(self, session_id: str, model: str) -> None:
+    def update_session_model(
+        self, session_id: str, model: str, provider: Optional[str] = None
+    ) -> None:
         """Update the model for a session after a mid-session switch.
 
         Unlike ``update_token_counts`` which uses ``COALESCE(model, ?)``
@@ -4280,6 +5914,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         footer metadata is rebuilt on the next turn. A successful /model
         switch explicitly replaces any confirmed Browser runtime lock while
         preserving unrelated lineage markers in ``model_config``.
+
+        When *provider* is given, it is merged into ``model_config``
+        alongside the model (``$.model`` / ``$.provider``) so a later
+        resume recombines the persisted model with the provider that
+        actually serves it instead of the config.yaml primary provider
+        (#79536). Callers without provider knowledge leave any stored
+        provider untouched.
         """
         # This write bypasses the token queue, so deltas enqueued before the
         # switch must land first: a still-queued first delta carries the
@@ -4290,22 +5931,118 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.flush_token_counts()
 
         def _do(conn):
+            # Use the shared merge discipline so lineage markers like
+            # _branched_from / _delegate_from survive. browser_model_lock
+            # is deleted via a None patch value (same semantics as the
+            # old json_remove).
+            patch: Dict[str, Any] = {"browser_model_lock": None}
+            if model:
+                patch["model"] = model
+            if provider:
+                patch["provider"] = provider
+            merged = self._merge_model_config_json(conn, session_id, patch)
+            if merged is _MODEL_CONFIG_ROW_MISSING:
+                return
             conn.execute(
-                """UPDATE sessions SET
-                   model = ?,
-                   model_config = CASE
-                       WHEN model_config IS NULL THEN NULL
-                       WHEN json_valid(model_config)
-                           THEN json_remove(model_config, '$.browser_model_lock')
-                       ELSE model_config
-                   END,
-                   system_prompt = NULL,
-                   system_prompt_hash = NULL
-                   WHERE id = ?""",
-                (model, session_id),
+                "UPDATE sessions SET "
+                "model = ?, model_config = ?, "
+                "system_prompt = NULL, system_prompt_hash = NULL "
+                "WHERE id = ?",
+                (model, merged, session_id),
             )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
+
+    def _merge_model_config_json(
+        self,
+        conn,
+        session_id: str,
+        patch: Dict[str, Any],
+        *,
+        on_missing: str = "skip",
+    ):
+        """SELECT + tolerant-parse + merge ``patch`` into a session's model_config.
+
+        Shared by every model_config writer (``update_session_runtime_lock``,
+        ``set_session_yolo``, ``archive_and_compact``,
+        ``patch_session_model_config``) so the merge discipline that keeps
+        lineage markers like ``_branched_from`` / ``_delegate_from`` alive
+        lives in exactly one place. A ``None`` patch value deletes that key.
+        Must run inside an open write transaction (callers own the UPDATE).
+
+        Returns the serialized merged JSON — ``None`` when the merged dict is
+        empty (matching ``create_session``'s NULL convention) — or the
+        ``_MODEL_CONFIG_ROW_MISSING`` sentinel when the row doesn't exist and
+        ``on_missing == "skip"``; ``on_missing == "raise"`` raises ValueError.
+        """
+        row = conn.execute(
+            "SELECT model_config FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            if on_missing == "raise":
+                raise ValueError(f"Session not found: {session_id}")
+            return _MODEL_CONFIG_ROW_MISSING
+        raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+        config: Dict[str, Any] = {}
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    config = parsed
+            except (json.JSONDecodeError, TypeError):
+                config = {}
+        elif isinstance(raw, dict):
+            config = dict(raw)
+        for key, value in patch.items():
+            if value is None:
+                config.pop(key, None)
+            else:
+                config[key] = value
+        return json.dumps(config) if config else None
+
+    def patch_session_model_config(
+        self, session_id: str, patch: Dict[str, Any]
+    ) -> None:
+        """Merge ``patch`` into a session's model_config JSON atomically.
+
+        A ``None`` patch value removes that key. No-op when the session row
+        doesn't exist or the patch is empty. This is the standalone setter for
+        callers that need to update model_config *without* rewriting the
+        transcript (the transcript-coupled path is ``archive_and_compact``'s
+        ``model_config_patch``, which shares the same merge helper).
+        """
+        if not session_id or not patch:
+            return
+
+        def _do(conn):
+            merged = self._merge_model_config_json(conn, session_id, patch)
+            if merged is _MODEL_CONFIG_ROW_MISSING:
+                return
+            conn.execute(
+                "UPDATE sessions SET model_config = ? WHERE id = ?",
+                (merged, session_id),
+            )
+
+        self._execute_write(_do)
+
+    def get_session_model_config_value(
+        self, session_id: str, key: str, default: Any = None
+    ) -> Any:
+        """Read one key out of a session's model_config JSON (tolerant parse)."""
+        session = self.get_session(session_id) or {}
+        raw = session.get("model_config")
+        config: Dict[str, Any] = {}
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    config = parsed
+            except (json.JSONDecodeError, TypeError):
+                config = {}
+        elif isinstance(raw, dict):
+            config = raw
+        return config.get(key, default)
 
     def update_session_runtime_lock(
         self,
@@ -4333,24 +6070,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         }
 
         def _do(conn):
-            row = conn.execute(
-                "SELECT model_config FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
+            merged = self._merge_model_config_json(
+                conn, session_id, {"browser_model_lock": lock}
+            )
+            if merged is _MODEL_CONFIG_ROW_MISSING:
                 return
-            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
-            config: Dict[str, Any] = {}
-            if isinstance(raw, str) and raw.strip():
-                try:
-                    parsed = json.loads(raw)
-                    if isinstance(parsed, dict):
-                        config = parsed
-                except Exception:
-                    config = {}
-            elif isinstance(raw, dict):
-                config = dict(raw)
-            config["browser_model_lock"] = lock
             conn.execute(
                 """UPDATE sessions SET
                    model_config = ?,
@@ -4358,7 +6082,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    system_prompt = NULL,
                    system_prompt_hash = NULL
                    WHERE id = ?""",
-                (json.dumps(config), model, session_id),
+                (merged, model, session_id),
             )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
@@ -4379,27 +6103,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
-            row = conn.execute(
-                "SELECT model_config FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
+            merged = self._merge_model_config_json(
+                conn, session_id, {"yolo_mode": bool(enabled)}
+            )
+            if merged is _MODEL_CONFIG_ROW_MISSING:
                 return
-            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
-            config: Dict[str, Any] = {}
-            if isinstance(raw, str) and raw.strip():
-                try:
-                    parsed = json.loads(raw)
-                    if isinstance(parsed, dict):
-                        config = parsed
-                except Exception:
-                    config = {}
-            elif isinstance(raw, dict):
-                config = dict(raw)
-            config["yolo_mode"] = bool(enabled)
             conn.execute(
                 "UPDATE sessions SET model_config = ? WHERE id = ?",
-                (json.dumps(config), session_id),
+                (merged, session_id),
             )
         self._execute_write(_do)
 
@@ -4420,6 +6131,59 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not isinstance(raw, dict):
             return False
         return bool(raw.get("yolo_mode"))
+
+    @staticmethod
+    def session_gateway_runtime(session_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Read the persisted runtime route off a session row dict.
+
+        Accepts the dict returned by ``get_session`` (``model_config`` is a
+        JSON string) or an already-parsed dict. Prefers the nested
+        ``gateway_runtime`` key (written by the gateway's
+        ``_sync_session_model_from_agent`` and the CLI ``/model`` persist),
+        falling back to the top-level ``provider``/``base_url``/``api_mode``
+        keys the TUI gateway's ``_runtime_model_config`` writes. As a last
+        resort, falls back to the ``billing_provider`` column (written on
+        every session's first accounted API call) so sessions that never ran
+        ``/model`` still restore the provider that actually served them.
+        Returns an empty dict on any parse failure — resume falls back to
+        ambient config resolution.
+        """
+        raw = (session_meta or {}).get("model_config")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        runtime = raw.get("gateway_runtime")
+        if isinstance(runtime, dict) and runtime.get("provider"):
+            # Filter None values: the persist path writes or-None to trigger
+            # deletion in the top-level merge, but gateway_runtime is replaced
+            # as a whole dict (not deep-merged), so None values survive here.
+            return {k: v for k, v in runtime.items() if v is not None}
+        top_level = {
+            key: raw.get(key)
+            for key in ("provider", "base_url", "api_mode")
+            if raw.get(key)
+        }
+        if top_level:
+            return top_level
+        # Last resort: billing_provider column. Written via COALESCE on every
+        # session's first accounted API call — the only durable record for
+        # sessions that never ran /model. Mirrors the TUI gateway's
+        # _stored_session_runtime_overrides fallback. Bare billing buckets
+        # ("auto"/"custom") are not routable identities — filter them out so
+        # resume falls back to the ambient config default instead.
+        billing_provider = str(
+            (session_meta or {}).get("billing_provider") or ""
+        ).strip()
+        if (
+            billing_provider
+            and billing_provider.lower() not in _BARE_BILLING_PROVIDERS
+        ):
+            return {"provider": billing_provider}
+        return {k: v for k, v in (runtime or {}).items() if v is not None} if isinstance(runtime, dict) else {}
 
     def update_session_billing_route(
         self,
@@ -5153,12 +6917,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if exact:
             return exact["id"]
 
-        escaped = (
-            session_id_or_prefix
-            .replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
+        escaped = _escape_like(session_id_or_prefix)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
@@ -5171,6 +6930,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # Maximum length for session titles
     MAX_TITLE_LENGTH = 100
+
+    # Title provenance, lowest to highest authority. An auto-titling write may
+    # only replace a title of strictly lower authority, so the instant
+    # ``derived`` title upgrades to the model's ``llm`` title exactly once and
+    # nothing the agent generates can ever clobber a name the user typed.
+    TITLE_SOURCE_DERIVED = "derived"
+    TITLE_SOURCE_LLM = "llm"
+    TITLE_SOURCE_USER = "user"
+    _TITLE_SOURCE_RANK = {
+        TITLE_SOURCE_DERIVED: 0,
+        TITLE_SOURCE_LLM: 1,
+        TITLE_SOURCE_USER: 2,
+    }
+
+    @classmethod
+    def _title_rank(cls, source: Optional[str]) -> int:
+        """Rank a stored title_source. NULL means a pre-provenance row.
+
+        Rows written before this column existed carry NULL. They were almost
+        always set by the old auto-titler, but a manual ``/title`` from that
+        era is indistinguishable — so treat NULL as ``user`` and refuse to
+        overwrite it. Auto-titling only ever fills genuinely empty titles on
+        legacy rows, which is the conservative direction.
+        """
+        if source is None:
+            return cls._TITLE_SOURCE_RANK[cls.TITLE_SOURCE_USER]
+        return cls._TITLE_SOURCE_RANK.get(str(source), 0)
 
     @staticmethod
     def sanitize_title(title: Optional[str]) -> Optional[str]:
@@ -5262,17 +7048,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         title: str,
         *,
-        only_if_empty: bool,
+        source: str,
     ) -> bool:
+        """Write a title, enforcing provenance precedence.
+
+        ``source`` is one of ``TITLE_SOURCE_{DERIVED,LLM,USER}``. A ``user``
+        write always lands — an explicit rename is authoritative. An automatic
+        write (``derived``/``llm``) lands only when the row is untitled or the
+        stored title has strictly lower authority, so the instant ``derived``
+        title upgrades to ``llm`` exactly once and neither can ever overwrite a
+        name the user typed. Re-running the titler on an already-``llm`` row is
+        a no-op, which is what stops a session renaming itself.
+
+        The read and the write are one compare-and-swap inside a single
+        transaction, so a manual ``/title`` racing an in-flight generation
+        cannot be clobbered by the late arrival.
+        """
         title = self.sanitize_title(title)
+        is_user = source == self.TITLE_SOURCE_USER
+        new_rank = self._title_rank(source) if not is_user else None
 
         def _do(conn):
-            if only_if_empty:
-                current = conn.execute(
-                    "SELECT title FROM sessions WHERE id = ?",
-                    (session_id,),
-                ).fetchone()
-                if current is None or current["title"] is not None:
+            current = conn.execute(
+                "SELECT title, title_source FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if current is None:
+                return 0
+            if not is_user and current["title"] is not None:
+                if self._title_rank(current["title_source"]) >= new_rank:
                     return 0
 
             if title:
@@ -5306,10 +7110,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         raise ValueError(
                             f"Title '{title}' is already in use by session {conflict_id}"
                         )
-            predicate = " AND title IS NULL" if only_if_empty else ""
+            # Compare-and-swap on the exact values we just read (``IS`` is
+            # NULL-safe in SQLite), so a concurrent write between the SELECT
+            # and here loses instead of being silently overwritten.
             cursor = conn.execute(
-                f"UPDATE sessions SET title = ? WHERE id = ?{predicate}",
-                (title, session_id),
+                "UPDATE sessions SET title = ?, title_source = ? "
+                "WHERE id = ? AND title IS ? AND title_source IS ?",
+                (
+                    title,
+                    source if title else None,
+                    session_id,
+                    current["title"],
+                    current["title_source"],
+                ),
             )
             return cursor.rowcount
 
@@ -5317,23 +7130,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return rowcount > 0
 
     def set_session_title(self, session_id: str, title: str) -> bool:
-        """Set or update a session's title.
+        """Set or update a session's title on the user's behalf.
 
         Returns True if session was found and title was set.
         Raises ValueError if title is already in use by another session,
         or if the title fails validation (too long, invalid characters).
         Empty/whitespace-only strings are normalized to None (clearing the title).
+
+        This records ``user`` provenance, so auto-titling will never replace
+        the result. Automatic callers must use :meth:`set_auto_title`.
         """
-        return self._set_session_title(session_id, title, only_if_empty=False)
+        return self._set_session_title(
+            session_id, title, source=self.TITLE_SOURCE_USER
+        )
+
+    def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
+        """Set an automatically generated title, honoring provenance precedence.
+
+        Returns True when the title was written, False when a higher-authority
+        title already holds the row (nothing is modified in that case).
+        """
+        if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
+            raise ValueError(f"invalid automatic title source: {source!r}")
+        return self._set_session_title(session_id, title, source=source)
 
     def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
-        """Set an auto-generated title only when the current title is NULL.
+        """Back-compat shim: set an LLM title only if nothing better exists.
 
-        The predicate and write run in one transaction so a concurrent manual
-        rename cannot be overwritten. Validation and uniqueness behavior match
-        :meth:`set_session_title`.
+        Retained because older callers (and third-party plugins) reference it
+        by name. New code should call :meth:`set_auto_title` with an explicit
+        source.
         """
-        return self._set_session_title(session_id, title, only_if_empty=True)
+        return self.set_auto_title(
+            session_id, title, source=self.TITLE_SOURCE_LLM
+        )
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
@@ -5343,6 +7173,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             row = cursor.fetchone()
         return row["title"] if row else None
+
+    def get_session_title_source(self, session_id: str) -> Optional[str]:
+        """Get the provenance of a session's title, or None when untitled."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT title, title_source FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+        if not row or row["title"] is None:
+            return None
+        return row["title_source"]
+
+    def set_session_title_source(self, session_id: str, source: str) -> bool:
+        """Overwrite a title's provenance without touching the title text.
+
+        Used when a title is carried across a session boundary (compression
+        rotation) and the copy must keep the original's authority rather than
+        the authority of whichever setter performed the copy.
+        """
+        if source not in self._TITLE_SOURCE_RANK:
+            raise ValueError(f"invalid title source: {source!r}")
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET title_source = ? "
+                "WHERE id = ? AND title IS NOT NULL",
+                (source, session_id),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
 
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
         """Archive or unarchive a session.
@@ -5446,6 +7308,80 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
+    def set_session_read(self, session_id: str, read: bool = True) -> bool:
+        """Mark a session read or unread (and its whole compression lineage).
+
+        Read state is a watermark, not a flag: ``last_read_at`` records when
+        the conversation was last read, and it counts as unread when activity
+        postdates that watermark (the derived ``unread`` key on
+        :meth:`list_sessions_rich` rows). New messages therefore flip a read
+        conversation back to unread without any write on the message path.
+        Three states:
+
+        * NULL — never tracked (every pre-feature row): treated as read, so
+          shipping the column doesn't badge a user's entire history at once.
+        * 0 — explicitly marked unread: any activity postdates it.
+        * timestamp — read up to that moment.
+
+        Like :meth:`set_session_archived` / :meth:`set_session_pinned`, the
+        whole compression chain is stamped as a unit, so reading the surfaced
+        tip clears the root (and vice-versa) no matter which id the caller
+        holds. Returns True when at least one row changed.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET last_read_at = ?
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                (session_id, session_id, time.time() if read else 0.0),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            return rowcount
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
+    @staticmethod
+    def session_unread(session_row: Dict[str, Any]) -> bool:
+        """Derive unread from a session row's watermark and activity.
+
+        Shared by ``list_sessions_rich`` and any future surface that holds a
+        row (or projected row) with ``last_read_at`` and ``last_active``.
+        NULL watermark = never tracked = read.
+        """
+        last_read = session_row.get("last_read_at")
+        if last_read is None:
+            return False
+        last_active = session_row.get("last_active") or session_row.get("started_at")
+        return float(last_active or 0) > float(last_read)
+
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
         with self._read_ctx() as conn:
@@ -5473,7 +7409,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
-        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        escaped = _escape_like(title)
         with self._read_ctx() as conn:
             cursor = conn.execute(
                 "SELECT id, title, started_at FROM sessions "
@@ -5504,7 +7440,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Find all existing numbered variants
         # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
-        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        escaped = _escape_like(base)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
@@ -5595,6 +7531,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     )
     _session_compact_cols_sql: Optional[str] = None
 
+    def usage_totals(self, *, min_message_count: int = 1, include_archived: bool = False) -> Dict[str, float]:
+        """Tokens and spend across this store, as one aggregate.
+
+        The sidebar shows a profile's totals beside a page of its sessions, so
+        summing the rows it happens to have loaded would report a fraction of
+        the truth and shrink as paging changed. SQLite adds the columns up over
+        every row instead, at the cost of one scan.
+
+        Spend is the billed figure when the provider returned one and the
+        estimate otherwise — the same precedence a single row renders.
+        """
+        where = ["parent_session_id IS NULL", "message_count >= ?"]
+        params: List[Any] = [min_message_count]
+        if not include_archived:
+            where.append("COALESCE(archived, 0) = 0")
+
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
+                       COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)), 0)
+                  FROM sessions
+                 WHERE {' AND '.join(where)}
+                """,
+                params,
+            ).fetchone()
+
+        return {"tokens": int(row[0] or 0), "cost_usd": float(row[1] or 0.0)}
+
     def list_sessions_rich(
         self,
         source: str = None,
@@ -5624,8 +7589,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Uses a single query with correlated subqueries instead of N+2 queries.
 
-        By default, child sessions (subagent runs, compression continuations)
-        are excluded.  Pass ``include_children=True`` to include them.
+        By default, child sessions that represent implementation details
+        (subagent runs, compression continuations) are excluded. User-visible
+        branch and reset children remain listable. Pass ``include_children=True``
+        to include every child.
 
         With ``project_compression_tips=True`` (default), sessions that are
         roots of compression chains are projected forward to their latest
@@ -5674,10 +7641,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         params = []
 
         if not include_children:
-            # Show root sessions and branch sessions, while still hiding
-            # sub-agent runs and compression continuations (which also carry a
-            # parent_session_id but were spawned while the parent was still
-            # live — i.e., started_at < parent.ended_at).
+            # Show roots and user-visible branch/reset sessions, while still
+            # hiding sub-agent runs and compression continuations. All four
+            # carry parent_session_id, so the shared predicate classifies the
+            # edge from stable markers plus legacy-compatible parent metadata.
             #
             # Branch sessions are identified two ways, OR'd for robustness:
             #   1. A stable ``_branched_from`` marker in model_config, written
@@ -5745,8 +7712,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # level instead of fetching every row and sorting in Python, while
             # still surfacing old compression roots whose live tip is fresh.
             #
-            # The CTE seeds from rows the outer WHERE admits (roots + branch
-            # children), then recursively joins forward through robust
+            # The CTE seeds from rows the outer WHERE admits (roots +
+            # user-visible branch/reset children), then recursively joins through
             # compression-continuation edges. Do NOT require
             # child.started_at >= parent.ended_at here: real desktop/gateway
             # races can insert the continuation row before the parent's
@@ -5757,10 +7724,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             filter_clauses: List[str] = []
 
             def _like_pattern(needle: str) -> str:
-                escaped = (
-                    needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                )
-                return f"%{escaped}%"
+                return f"%{_escape_like(needle)}%"
 
             if id_needle:
                 # Admit a surfaced row if its own id or any id in its forward
@@ -5962,6 +7926,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 projected.append(merged)
             sessions = projected
 
+        # Derive read state per surfaced conversation. ``last_read_at`` is
+        # lineage-stamped by set_session_read, so a projected row's root
+        # watermark and its tip's are the same value — comparing it against
+        # the tip's last_active is correct either way.
+        for s in sessions:
+            s["unread"] = self.session_unread(s)
+
         return sessions
 
     # =========================================================================
@@ -6108,6 +8079,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         return meta
 
+    @staticmethod
+    def _reasoning_json_text(value: Any) -> Optional[str]:
+        """Serialize a structured reasoning field for its TEXT column.
+
+        ``reasoning_details`` / ``codex_reasoning_items`` / ``codex_message_items``
+        arrive as list/dict structures from the live runtime, but callers that
+        round-trip stored rows — ``get_messages`` straight into
+        ``replace_messages``, e.g. the POST /api/sessions/{id}/fork handler —
+        hand back the raw TEXT these columns already hold, because
+        ``get_messages`` only deserializes ``content`` and ``tool_calls``.
+        Re-dumping that TEXT double-encodes it, and the forked session's next
+        ``get_messages_as_conversation`` json.loads then yields the inner
+        string instead of the original list, so every reasoning-replay consumer
+        (all of which check ``isinstance(..., list)``) silently drops it.
+        Strings are therefore stored as-is; structures are dumped.
+        """
+        if not value:
+            return None
+        if isinstance(value, str):
+            return value
+        return json.dumps(value)
+
     def append_message(
         self,
         session_id: str,
@@ -6156,18 +8149,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # context role/content replayed to providers.
         display_metadata_json = self._encode_display_metadata(display_metadata)
         # Serialize structured fields to JSON before entering the write txn
-        reasoning_details_json = (
-            json.dumps(reasoning_details)
-            if reasoning_details else None
-        )
-        codex_items_json = (
-            json.dumps(codex_reasoning_items)
-            if codex_reasoning_items else None
-        )
-        codex_message_items_json = (
-            json.dumps(codex_message_items)
-            if codex_message_items else None
-        )
+        reasoning_details_json = self._reasoning_json_text(reasoning_details)
+        codex_items_json = self._reasoning_json_text(codex_reasoning_items)
+        codex_message_items_json = self._reasoning_json_text(codex_message_items)
         # tool_calls may arrive as a Python list (from the live agent) or
         # as a JSON string (from import/export). Parse first to avoid
         # double-encoding.
@@ -6602,15 +8586,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             codex_message_items = (
                 msg.get("codex_message_items") if role == "assistant" else None
             )
-            reasoning_details_json = (
-                json.dumps(reasoning_details) if reasoning_details else None
-            )
-            codex_items_json = (
-                json.dumps(codex_reasoning_items) if codex_reasoning_items else None
-            )
-            codex_message_items_json = (
-                json.dumps(codex_message_items) if codex_message_items else None
-            )
+            reasoning_details_json = self._reasoning_json_text(reasoning_details)
+            codex_items_json = self._reasoning_json_text(codex_reasoning_items)
+            codex_message_items_json = self._reasoning_json_text(codex_message_items)
             # tool_calls may arrive as a Python list (from the live agent)
             # or as a JSON string (from import_sessions / export_session,
             # which store it as TEXT). json.dumps on an already-serialized
@@ -6629,7 +8607,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             api_content = msg.get("api_content")
 
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
@@ -6659,6 +8637,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
+            if isinstance(msg, dict) and cur.lastrowid is not None:
+                msg["_row_id"] = cur.lastrowid
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
@@ -6672,6 +8652,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         messages: List[Dict[str, Any]],
         active_only: bool = False,
+        archive_dropped: bool = False,
     ) -> None:
         """Atomically replace the stored messages for a session.
 
@@ -6692,6 +8673,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         full-history rewrite doesn't wipe the rows the agent deliberately
         archived. ``message_count``/``tool_call_count`` then track the live set,
         matching :meth:`archive_and_compact`.
+
+        Pass ``archive_dropped=True`` to SOFT-archive the live rows instead of
+        DELETEing them: the replaced turns stay on disk with ``active = 0``,
+        ``compacted = 0`` — the same "the user took it back" marking
+        :meth:`rewind_to_message` applies — and stay readable via
+        :meth:`get_messages` with ``include_inactive=True``. This is the mode a
+        rewind/edit/regenerate must use: those flows overwrite a transcript the
+        user may not have meant to drop, and a plain DELETE also evicts the rows
+        from the FTS index, leaving nothing to recover from (#82756). It implies
+        active-only handling — already-archived rows are never touched — so
+        ``active_only`` is redundant with it. The rewritten set is inserted as
+        fresh active rows exactly as in the destructive path, so the live view
+        is identical either way; only the durability of the dropped turns
+        differs.
         """
 
         active_clause = " AND active = 1" if active_only else ""
@@ -6707,10 +8702,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 and session["end_reason"] == "compression"
             ):
                 raise CompressionSessionClosedError(session_id)
-            conn.execute(
-                f"DELETE FROM messages WHERE session_id = ?{active_clause}",
-                (session_id,),
-            )
+            if archive_dropped:
+                # Content-preserving UPDATE: the rows keep their FTS entries
+                # (the messages_fts triggers fire on INSERT / DELETE / UPDATE
+                # of content columns, not on `active`), so the replaced turns
+                # stay readable via get_messages(include_inactive=True) and
+                # searchable with include_inactive=True after the rewrite.
+                conn.execute(
+                    "UPDATE messages SET active = 0 "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                )
+            else:
+                conn.execute(
+                    f"DELETE FROM messages WHERE session_id = ?{active_clause}",
+                    (session_id,),
+                )
             conn.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
@@ -6728,9 +8735,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
 
-        Used by callers (e.g. the ACP adapter's ``_persist``) that must decide
-        whether a full-history :meth:`replace_messages` would destroy durable
-        compaction-archived turns. Cheap existence probe — does not load rows.
+        Cheap existence probe — does not load rows. NOTE: production rewrite
+        paths no longer branch on this (they pass ``active_only=True``
+        unconditionally — a probe can fail open or race a concurrent
+        ``archive_and_compact``, #80216); kept for tests and diagnostics.
         """
         with self._lock:
             cursor = self._conn.execute(
@@ -6740,7 +8748,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cursor.fetchone() is not None
 
     def archive_and_compact(
-        self, session_id: str, compacted_messages: List[Dict[str, Any]]
+        self,
+        session_id: str,
+        compacted_messages: List[Dict[str, Any]],
+        model_config_patch: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -6763,10 +8774,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         This is the durability-preserving alternative to :meth:`replace_messages`
         for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
-        matching what the live load returns. Returns the new active count.
+        matching what the live load returns. ``model_config_patch`` is merged
+        into the session's JSON config in the same transaction; a ``None``
+        value removes that key. Returns the new active count.
         """
 
         def _do(conn):
+            patched_model_config = None
+            if model_config_patch is not None:
+                # on_missing="raise": a prune/compaction must not commit
+                # against a vanished session row (the compressor's caller
+                # converts the raised error into a safe keep-the-original
+                # no-op), unlike the flag setters which tolerate missing rows.
+                patched_model_config = self._merge_model_config_json(
+                    conn, session_id, model_config_patch, on_missing="raise"
+                )
+
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it
@@ -6783,10 +8806,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (inserted, tool_calls_total, session_id),
-            )
+            if model_config_patch is None:
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                    (inserted, tool_calls_total, session_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                    "model_config = ? WHERE id = ?",
+                    (inserted, tool_calls_total, patched_model_config, session_id),
+                )
             return inserted
 
         return self._execute_write(_do)
@@ -6829,6 +8859,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_inactive: bool = False,
         limit: Optional[int] = None,
         offset: int = 0,
+        latest: bool = False,
+        after_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -6843,15 +8875,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         When ``limit`` is provided, returns at most ``limit`` messages
         starting from ``offset`` (0-based, in insertion order). Enables
         pagination for the API endpoint to avoid loading entire transcripts.
-        ``offset`` alone (without ``limit``) also pages — SQLite requires a
-        LIMIT clause for OFFSET, so it's emitted as ``LIMIT -1`` (unbounded).
+        With ``latest=True``, the offset is measured back from the newest
+        message and the selected page is still returned in chronological
+        order. ``offset`` alone (without ``limit``) also pages — SQLite
+        requires a LIMIT clause for OFFSET, so it's emitted as ``LIMIT -1``
+        (unbounded).
+
+        ``after_id`` enables keyset pagination (``id > after_id``): O(1)
+        page seeks on huge transcripts where OFFSET degrades to O(n) per
+        page. Ascending order only (incompatible with ``latest``/``offset``).
         """
+        if after_id is not None and (latest or offset):
+            raise ValueError("after_id is incompatible with latest/offset paging")
         active_clause = "" if include_inactive else " AND active = 1"
+        keyset_clause = " AND id > ?" if after_id is not None else ""
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
-            f"{active_clause} ORDER BY id"
+            f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
         )
         params: list = [session_id]
+        if after_id is not None:
+            params.append(after_id)
         if limit is not None or offset:
             # SQLite's OFFSET requires LIMIT; -1 means "no limit".
             sql += " LIMIT ? OFFSET ?"
@@ -6859,6 +8903,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             cursor = conn.execute(sql, params)
             rows = cursor.fetchall()
+        if latest:
+            rows.reverse()
         result = []
         for row in rows:
             msg = dict(row)
@@ -6874,6 +8920,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
         return result
+
+    def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
+        """Tool results in these sessions that mention a GitHub PR url.
+
+        A candidate scan, deliberately loose: it hands back every tool result
+        containing ``/pull/`` and leaves the caller to decide which ones make a
+        claim (see the desktop's PR recovery, which only accepts an output that
+        is a bare PR url — the signature of ``gh pr create``). Ordered
+        oldest-first per session so the caller can take the last match.
+        """
+        found: List[Dict[str, Any]] = []
+        ids = [s for s in session_ids if s]
+        for start in range(0, len(ids), 900):  # SQLite's bound-variable ceiling.
+            chunk = ids[start : start + 900]
+            placeholders = ",".join("?" * len(chunk))
+            with self._read_ctx() as conn:
+                rows = conn.execute(
+                    f"""SELECT session_id, content FROM messages
+                        WHERE session_id IN ({placeholders})
+                          AND role = 'tool' AND content LIKE '%/pull/%'
+                        ORDER BY id ASC""",
+                    chunk,
+                ).fetchall()
+            found.extend({"session_id": row[0], "content": row[1]} for row in rows)
+        return found
 
     def get_messages_around(
         self,
@@ -7018,18 +9089,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
                 # Walk to the most-recently-started child — but skip explicit
                 # branch (`_branched_from`), delegate/subagent (`_delegate_from`),
-                # and tool children. They also carry a ``parent_session_id`` yet
+                # reset-continuation (`_reset_from` or the legacy same-key
+                # heuristic — a post-reset conversation must never be reached
+                # by resuming the parent the user reset away), and tool
+                # children. They also carry a ``parent_session_id`` yet
                 # are NOT compression continuations; following them would hijack
                 # the resume target to an unrelated session (e.g. a subagent
                 # run). This mirrors the child-exclusion in ``get_compression_tip``.
                 try:
                     child_row = self._conn.execute(
-                        "SELECT id FROM sessions "
-                        "WHERE parent_session_id = ? "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL "
-                        "  AND COALESCE(source, '') != 'tool' "
-                        "ORDER BY started_at DESC, id DESC LIMIT 1",
+                        "SELECT id FROM sessions AS child "
+                        "WHERE child.parent_session_id = ? "
+                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
+                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
+                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._reset_from') IS NULL "
+                        f"  AND NOT {_legacy_reset_child_sql('child', _RESET_END_REASONS_SQL)} "
+                        "  AND COALESCE(child.source, '') != 'tool' "
+                        "ORDER BY child.started_at DESC, child.id DESC LIMIT 1",
                         (current,),
                     ).fetchone()
                 except Exception:
@@ -7293,6 +9369,90 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             include_row_ids=True,
         )
         return model_history, display_history
+
+    def get_resume_message_count(self, session_id: str) -> int:
+        """Count active rows that a full resume would materialize."""
+        session_ids = self._session_lineage_root_to_tip(session_id)
+        placeholders = ",".join("?" for _ in session_ids)
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM messages "
+                f"WHERE session_id IN ({placeholders}) AND active = 1",
+                tuple(session_ids),
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+    def assert_resume_safe(
+        self,
+        session_id: str,
+        max_messages: Optional[int] = None,
+    ) -> int:
+        """Return resume row count or reject a transcript too large to load.
+
+        ``max_messages=None`` resolves the limit from config
+        (``sessions.max_resume_messages``); 0 disables the guard and returns
+        the (bounded) count without raising.
+        """
+        if max_messages is None:
+            max_messages = resolved_max_resume_messages()
+        if max_messages < 0:
+            raise ValueError("max_messages must be non-negative")
+        if max_messages == 0:
+            # Guard disabled by config — skip counting entirely. Every live
+            # caller invokes this for its raise side effect and ignores the
+            # return value, and an unbounded lineage COUNT here would do the
+            # exact pathological work the disable exists to avoid.
+            return 0
+        session_ids = self._session_lineage_root_to_tip(session_id)
+        placeholders = ",".join("?" for _ in session_ids)
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM ("
+                f"SELECT 1 FROM messages WHERE session_id IN ({placeholders}) "
+                "AND active = 1 LIMIT ?"
+                ")",
+                (*session_ids, max_messages + 1),
+            ).fetchone()
+        message_count = int(row[0] if row else 0)
+        if message_count > max_messages:
+            raise SessionResumeTooLargeError(message_count, max_messages)
+        return message_count
+
+    def assert_export_safe(
+        self,
+        session_id: str,
+        max_messages: Optional[int] = None,
+    ) -> int:
+        """Return active row count or reject an unsafe in-memory export.
+
+        Exporting one session does not include compression ancestors, so this
+        guard deliberately counts only the requested segment. The limited
+        subquery stops as soon as it proves the transcript exceeds the bound.
+
+        ``max_messages=None`` resolves the limit from config
+        (``sessions.max_export_messages``); 0 disables the guard and returns
+        the active row count without raising.
+        """
+        if max_messages is None:
+            max_messages = resolved_max_export_messages()
+        if max_messages < 0:
+            raise ValueError("max_messages must be non-negative")
+        if max_messages == 0:
+            # Guard disabled by config — skip the COUNT; live callers use
+            # this for its raise side effect only (and skip calling it
+            # entirely when the limit is 0).
+            return 0
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM ("
+                "SELECT 1 FROM messages WHERE session_id = ? AND active = 1 LIMIT ?"
+                ")",
+                (session_id, max_messages + 1),
+            ).fetchone()
+        message_count = int(row[0] if row else 0)
+        if message_count > max_messages:
+            raise SessionExportTooLargeError(session_id, message_count, max_messages)
+        return message_count
 
     def get_ancestor_display_prefix(self, session_id: str) -> List[Dict[str, Any]]:
         """Return the ancestor-only display messages for a session lineage.
@@ -7567,7 +9727,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Count sessions, optionally filtered by source.
 
         Pass ``exclude_children=True`` to count only the conversations that
-        ``list_sessions_rich`` surfaces (root + branch sessions), hiding
+        ``list_sessions_rich`` surfaces (root + branch/reset sessions), hiding
         sub-agent runs and compression continuations. Use it whenever the count
         is paired with a ``list_sessions_rich`` page (e.g. sidebar "load more"
         totals) so the total matches the number of listable rows — otherwise the
@@ -7583,8 +9743,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         if exclude_children:
             # Mirror list_sessions_rich's child-exclusion clause exactly so the
-            # count lines up with the rows: roots (no parent) plus branch
-            # children (parent ended with end_reason='branched').
+            # count lines up with the rows: roots plus user-visible branch/reset
+            # children.
             where_clauses.append(_LISTABLE_CHILD_SQL)
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
         include_sources = [source] if source else list(sources or [])
@@ -7646,8 +9806,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``list_sessions_rich``).
 
         ``exclude_children=True`` mirrors ``list_sessions_rich`` visibility
-        (roots + branch sessions, excluding sub-agent runs, delegates, and
-        compression continuations) so the source counts match what the
+        (roots + branch/reset sessions, excluding sub-agent runs, delegates,
+        and compression continuations) so the source counts match what the
         Sessions page actually lists.
         """
         where_clauses = []
@@ -7708,7 +9868,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Export and cleanup
     # =========================================================================
 
-    def _is_branch_child_row(self, session: Dict[str, Any]) -> bool:
+    def _is_explicit_fork_child_row(self, session: Dict[str, Any]) -> bool:
+        if session.get("source") == "tool":
+            return True
         raw = session.get("model_config")
         if not raw:
             return False
@@ -7716,11 +9878,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             cfg = json.loads(raw) if isinstance(raw, str) else raw
         except (TypeError, json.JSONDecodeError):
             return False
-        return isinstance(cfg, dict) and cfg.get("_branched_from") is not None
+        return isinstance(cfg, dict) and (
+            cfg.get("_branched_from") is not None
+            or cfg.get("_delegate_from") is not None
+        )
 
     def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:
         parent_id = child.get("parent_session_id")
-        if not parent_id or self._is_branch_child_row(child):
+        if not parent_id or self._is_explicit_fork_child_row(child):
             return False
         parent = self.get_session(parent_id)
         return bool(parent and parent.get("end_reason") == "compression")
@@ -7728,7 +9893,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def get_compression_lineage(self, session_id: str) -> List[str]:
         """Return compression ancestors through tip in chronological order."""
         session = self.get_session(session_id)
-        if not session or self._is_branch_child_row(session):
+        if not session or self._is_explicit_fork_child_row(session):
             return [session_id] if session else []
 
         root = session
@@ -7756,7 +9921,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             next_child = None
             for row in rows:
                 candidate = dict(row)
-                if not self._is_branch_child_row(candidate):
+                if self._is_compression_child_row(candidate):
                     next_child = candidate
                     break
             if not next_child or next_child["id"] in seen:
@@ -8181,8 +10346,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.source = ?")
             params.append(source)
         if title_like:
-            clauses.append("LOWER(COALESCE(s.title, '')) LIKE ?")
-            params.append(f"%{title_like.lower()}%")
+            clauses.append("LOWER(COALESCE(s.title, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(title_like.lower())}%")
         if end_reason:
             clauses.append("s.end_reason = ?")
             params.append(end_reason)
@@ -8197,8 +10362,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.message_count <= ?")
             params.append(max_messages)
         if model_like:
-            clauses.append("LOWER(COALESCE(s.model, '')) LIKE ?")
-            params.append(f"%{model_like.lower()}%")
+            clauses.append("LOWER(COALESCE(s.model, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(model_like.lower())}%")
         if provider:
             clauses.append("LOWER(COALESCE(s.billing_provider, '')) = ?")
             params.append(provider.lower())
@@ -8212,8 +10377,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.chat_type = ?")
             params.append(chat_type)
         if branch_like:
-            clauses.append("LOWER(COALESCE(s.git_branch, '')) LIKE ?")
-            params.append(f"%{branch_like.lower()}%")
+            clauses.append("LOWER(COALESCE(s.git_branch, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(branch_like.lower())}%")
         if min_tokens is not None:
             clauses.append(
                 "(COALESCE(s.input_tokens, 0) + COALESCE(s.output_tokens, 0)) >= ?"
@@ -8615,7 +10780,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             cursor = conn.execute(
                 "UPDATE sessions SET source = 'kanban' "
                 "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')",
-                (prefix, prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"),
+                (prefix, _escape_like(prefix) + "/%"),
             )
             # Read rowcount before set_meta reuses this cursor for its INSERT,
             # which would otherwise overwrite it with the meta write's count.
@@ -9196,12 +11361,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
         # VACUUM cannot be executed inside a transaction.
         with self._lock:
-            # Best-effort WAL checkpoint first, then VACUUM.
+            # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
+            # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
+            # CLI process, and a TRUNCATE reset here would race a live gateway
+            # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
+            # itself; journal_size_limit bounds the file.
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception as exc:
+                logger.debug("WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc)
+            self._conn.execute("VACUUM")
+            # ...and again afterwards. VACUUM rewrites every page THROUGH the
+            # WAL, so the pre-VACUUM checkpoint above does nothing for the
+            # slack VACUUM itself creates: on a 3.0 GB database it left a
+            # 3.07 GB state.db-wal behind, so `sessions optimize` reported
+            # "reclaimed -11.2 MB" while actually consuming 3 GB of disk and
+            # filling the host to 100%. Truncating here is what makes the
+            # command a net win instead of a net loss on large databases.
             try:
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception as exc:
-                logger.debug("WAL checkpoint (TRUNCATE) before VACUUM failed: %s", exc)
-            self._conn.execute("VACUUM")
+                logger.debug("WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc)
         return optimized
 
     def maybe_auto_prune_and_vacuum(
