@@ -818,7 +818,7 @@ The dispatcher refuses to re-spawn a ready task when it hit a quota/auth/429 err
 
 The `active_pr` guard only stops an **unintended** duplicate — it never blocks work you asked for on purpose. It steps aside automatically when:
 
-- a **deliberate continuation** supersedes the PR link — an explicit `hermes kanban unguard` (below), or an `unblock` recorded after it. Intentional follow-up / rework is exactly what the guard should allow;
+- a **deliberate continuation** supersedes the PR link — an explicit `hermes kanban unguard` (below), an `unblock`, or a review verdict that hands the card back to the implementer (`kanban_request_changes`, `reopen-review`) recorded after it. Intentional follow-up / rework is exactly what the guard should allow;
 - the task has **never run yet** (no run history at all). The guard exists to stop a *re*-spawn from duplicating a PR a previous worker opened; a task that was never spawned cannot own the PR its comments mention — typically that link is inherited context, e.g. the parent task's PR quoted in the briefing. Blocking there would strand the task's very first spawn, because no `unblock` or re-queue signal ever arrives to clear it; and
 - the PR is **no longer open** — a closed or merged PR has nothing left to duplicate. Live PR state is checked via the `gh` CLI when you enable `kanban.respawn_guard_check_pr_state: true` in `config.yaml` (off by default, since it needs an authenticated `gh`; an undeterminable state safely keeps the guard).
 

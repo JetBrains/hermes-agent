@@ -652,6 +652,54 @@ def test_respawn_guard_active_pr_cleared_by_unblock(kanban_home):
     assert reason is None
 
 
+def _handoff_with_pr(conn, title):
+    """Run a task through the review lane the way the dispatcher does.
+
+    Returns the task id, left in ``review`` with a PR-URL comment older than
+    whatever verdict the caller records next.
+    """
+    t = kb.create_task(conn, title=title, assignee="alice")
+    assert kb.claim_task(conn, t) is not None
+    run_id = kb.get_task(conn, t).current_run_id
+    _add_pr_comment_at(conn, t, int(time.time()) - 100)
+    assert kb.request_review(
+        conn, t, summary=f"PR up: {_PR_URL}", expected_run_id=run_id
+    ) is True
+    return t
+
+
+def test_respawn_guard_active_pr_cleared_by_request_changes(kanban_home):
+    """(b) A reviewer sending the card back for rework clears the guard.
+
+    ``request_changes`` hands the task back to the implementer *because* of
+    the PR in its comments; keeping the guard would park every review-driven
+    rework until the 24h window expires.
+    """
+    with kb.connect() as conn:
+        t = _handoff_with_pr(conn, "changes-requested")
+        assert kb.claim_review_task(conn, t) is not None
+        review_run = kb.get_task(conn, t).current_run_id
+        ok, _ = kb.request_changes(
+            conn, t, reason="redo the migration", expected_run_id=review_run
+        )
+        assert ok is True
+        reason = kb.check_respawn_guard(
+            conn, t, pr_state_resolver=lambda url: "open"
+        )
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_cleared_by_review_reopen(kanban_home):
+    """(b) Reopening a review handoff back to the implementer clears it too."""
+    with kb.connect() as conn:
+        t = _handoff_with_pr(conn, "review-reopened")
+        assert kb.reopen_review_task(conn, t) is True
+        reason = kb.check_respawn_guard(
+            conn, t, pr_state_resolver=lambda url: "open"
+        )
+    assert reason is None
+
+
 def test_respawn_guard_active_pr_cleared_by_unguard(kanban_home):
     """(b) The explicit operator override (clear_respawn_guard) clears it."""
     with kb.connect() as conn:
