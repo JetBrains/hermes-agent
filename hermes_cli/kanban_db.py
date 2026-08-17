@@ -7954,8 +7954,15 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 # defends against. ``unblocked`` is emitted by :func:`unblock_task`;
 # ``respawn_guard_cleared`` is the explicit operator override
 # (:func:`clear_respawn_guard`, wired to ``hermes kanban unguard``).
+# ``changes_requested`` (:func:`request_changes`) and ``review_reopened``
+# (:func:`reopen_review_task`) are the review lane's two rework verdicts:
+# both hand the card back to the implementer *because* of the PR that is
+# already in its comments, so treating that PR as a duplicate risk would
+# park every review-driven rework until the 24h window expires.
 _RESPAWN_GUARD_CLEAR_EVENT_KINDS = (
     "unblocked",
+    "changes_requested",
+    "review_reopened",
     "respawn_guard_cleared",
 )
 
@@ -9481,8 +9488,9 @@ def _has_fresh_continuation_signal(
        (``cleared_through_comment_id``). A clear that covers the newest PR
        comment wins regardless of timestamps — rowids are strictly monotonic,
        so "was this exact PR comment already acknowledged?" is decidable.
-    2. **Timestamp comparison, strictly newer.** Other kinds (``unblocked``)
-       are ordinary state transitions with no PR marker, so they still order
+    2. **Timestamp comparison, strictly newer.** Other kinds (``unblocked``,
+       ``changes_requested``, ``review_reopened``) are ordinary state
+       transitions with no PR marker, so they still order
        by ``created_at`` — but with ``>``, not ``>=``. A same-second tie is
        ambiguous, and the two readings are not symmetric: treating it as
        "fresher" lets an unblock that happened *before* a worker's PR comment
