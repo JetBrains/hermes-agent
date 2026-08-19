@@ -10,6 +10,7 @@ Uses slack-bolt (Python) with Socket Mode for:
 
 import asyncio
 import contextvars
+import hashlib
 import inspect
 import json
 import logging
@@ -822,6 +823,40 @@ def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> st
     return f"[Slack Block Kit payload for this message]\n```json\n{payload}\n```"
 
 
+def _slack_message_body_signature(message: dict) -> str:
+    """Return the part of a message body the agent is shown, as one value.
+
+    The inbound path builds the agent's text from the flat ``text`` *and* the
+    Block Kit payload, so an update that rewrites a bot card while keeping a
+    static fallback text changes what the agent reads even though ``text``
+    compares equal. Link unfurls are deliberately left out: Slack attaches
+    them to the message on its own, and treating that as a body change would
+    turn its own re-emit into another turn.
+    """
+    text = str((message or {}).get("text") or "")
+    blocks = (message or {}).get("blocks") or []
+    if not blocks:
+        return text
+    return "\n".join(
+        part
+        for part in (
+            text,
+            _extract_additional_text_from_slack_blocks(blocks, text),
+            _serialize_slack_blocks_for_agent(blocks),
+        )
+        if part
+    )
+
+
+def _slack_body_digest(body: str) -> str:
+    """Return a fixed-size fingerprint of a rendered message body.
+
+    Encoded with ``surrogatepass`` so an unpaired surrogate in a payload
+    cannot raise.
+    """
+    return hashlib.sha256(body.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def _extract_urls_from_slack_blocks(blocks: list) -> list[str]:
     """Walk a Block Kit ``blocks`` tree and return URLs found on any element.
 
@@ -1394,6 +1429,13 @@ class SlackAdapter(BasePlatformAdapter):
         # is later edited.
         self._processed_message_ts: Dict[str, float] = {}
         self._PROCESSED_MESSAGE_TS_MAX = 5000
+        # Digest of the message body last seen for a message ts, recorded
+        # before any await in _handle_slack_message. Lets the message_changed
+        # branch drop a re-emit whose body is unchanged while
+        # _processed_message_ts above is still unarmed. Only the digest is
+        # kept, so a rendered Block Kit payload never stays in memory.
+        self._seen_message_body_digest: Dict[str, str] = {}
+        self._SEEN_MESSAGE_BODY_DIGEST_MAX = 5000
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons. Bounded: an approval prompt the
         # user never clicks would otherwise leak its entry forever. Keys may
@@ -1557,6 +1599,19 @@ class SlackAdapter(BasePlatformAdapter):
             return
         for old_ts in sorted(timestamps, key=cls._slack_timestamp_sort_key)[:count]:
             timestamps.discard(old_ts)
+
+    def _remember_message_body(self, ts: str, body: str) -> None:
+        """Record a digest of the body last seen for *ts* (bounded).
+
+        Empty bodies are skipped so that edits to messages carrying only
+        files are never treated as unchanged.
+        """
+        if not ts or not body:
+            return
+        self._seen_message_body_digest[ts] = _slack_body_digest(body)
+        self._trim_oldest_dict_entries(
+            self._seen_message_body_digest, self._SEEN_MESSAGE_BODY_DIGEST_MAX
+        )
 
     def _trim_bot_message_timestamps(self) -> None:
         if len(self._bot_message_ts) <= self._BOT_TS_MAX:
@@ -6267,6 +6322,30 @@ class SlackAdapter(BasePlatformAdapter):
                     _slack_event_age(original_message_ts),
                 )
                 return
+            new_message_body = _slack_message_body_signature(updated_message)
+            if (
+                original_message_ts
+                and new_message_body
+                and self._seen_message_body_digest.get(original_message_ts)
+                == _slack_body_digest(new_message_body)
+            ):
+                # Slack re-dispatches message_changed for its own metadata
+                # updates (async language detection, unfurl) with the body
+                # byte-identical, typically while the original message is
+                # still in ingress. Such an event carries nothing new, and
+                # neither the guard above nor the dedup below stops it: the
+                # first is armed only after ingress, the second keys on
+                # _slack_changed_event_ts. An edit that changes the body —
+                # including one adding a bot mention, in the text or in the
+                # blocks — still passes.
+                logger.info(
+                    "[Slack] dropped message_changed with unchanged body "
+                    "ts=%s channel=%s age=%s",
+                    original_message_ts,
+                    event.get("channel", ""),
+                    _slack_event_age(original_message_ts),
+                )
+                return
             edited = updated_message.get("edited")
             edited_ts = ""
             if isinstance(edited, dict):
@@ -6320,6 +6399,19 @@ class SlackAdapter(BasePlatformAdapter):
         if self._is_ignored_channel(channel_id):
             logger.info("[Slack] Ignoring message in configured ignored channel %s", channel_id)
             return
+
+        # Baseline for the unchanged-body guard above. Still ahead of the
+        # first await, so a message_changed arriving mid-ingress has
+        # something to compare against, and past the two filters that
+        # precede it — the redelivery dedup and the ignored-channel check —
+        # so neither a replay nor an ignored channel takes a slot. The
+        # sender and content filters below run after this call, so those
+        # bodies are recorded even though the event is then dropped. After
+        # normalization ``event`` is the message body, so a let-through edit
+        # becomes the new baseline.
+        self._remember_message_body(
+            str(event.get("ts") or ""), _slack_message_body_signature(event)
+        )
 
         # Bot/app-authored message filtering (SLACK_ALLOW_BOTS / config
         # allow_bots):
