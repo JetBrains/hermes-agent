@@ -3046,6 +3046,190 @@ class TestMessageRouting:
         assert adapter.handle_message.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_attachment_only_update_during_ingress_still_routes(self, adapter):
+        """Authored attachments reach the agent, so a change in them counts."""
+        gate = _IngressGate(adapter)
+        loop = asyncio.get_event_loop()
+
+        fallback_text = "<@U_BOT> deploy status"
+
+        def _card(status: str) -> list:
+            return [{"title": "Deploy", "text": status}]
+
+        original = loop.create_task(
+            adapter._handle_slack_message(
+                {
+                    "text": fallback_text,
+                    "attachments": _card("step 1 running"),
+                    "user": "U_USER",
+                    "channel": "C123",
+                    "channel_type": "channel",
+                    "team": "T123",
+                    "ts": "1234567890.000001",
+                }
+            )
+        )
+        await asyncio.wait_for(gate.entry.wait(), 5)
+
+        update = loop.create_task(
+            adapter._handle_slack_message(
+                {
+                    "subtype": "message_changed",
+                    "channel": "C123",
+                    "channel_type": "channel",
+                    "team": "T123",
+                    "ts": "1234567891.000000",
+                    "event_ts": "1234567891.000000",
+                    "message": {
+                        "text": fallback_text,
+                        "attachments": _card("step 2 failed"),
+                        "user": "U_USER",
+                        "channel": "C123",
+                        "ts": "1234567890.000001",
+                    },
+                }
+            )
+        )
+        # The changed attachment passes the guard, so this one ingresses.
+        await asyncio.wait_for(gate.second_entry.wait(), 5)
+
+        gate.release()
+        await asyncio.wait_for(asyncio.gather(original, update), 5)
+
+        assert adapter.handle_message.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_link_unfurl_during_ingress_routes_once(self, adapter):
+        """A Slack-generated unfurl is not a body change: still one turn."""
+        gate = _IngressGate(adapter)
+        loop = asyncio.get_event_loop()
+
+        body = {
+            "text": "<@U_BOT> see https://example.com/report",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "1234567890.000001",
+        }
+
+        original = loop.create_task(
+            adapter._handle_slack_message(
+                {**body, "channel_type": "channel", "team": "T123"}
+            )
+        )
+        await asyncio.wait_for(gate.entry.wait(), 5)
+
+        reemit = loop.create_task(
+            adapter._handle_slack_message(
+                {
+                    "subtype": "message_changed",
+                    "channel": "C123",
+                    "channel_type": "channel",
+                    "team": "T123",
+                    "ts": "1234567891.000000",
+                    "event_ts": "1234567891.000000",
+                    "message": {
+                        **body,
+                        "attachments": [
+                            {
+                                "title": "Report",
+                                "text": "preview body",
+                                "from_url": "https://example.com/report",
+                                "original_url": "https://example.com/report",
+                                "service_name": "example.com",
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        try:
+            await asyncio.wait_for(reemit, 5)
+        except asyncio.TimeoutError:
+            pytest.fail("the unfurl re-emit entered the ingress instead of being dropped")
+        assert not gate.second_entry.is_set()
+
+        gate.release()
+        await asyncio.wait_for(original, 5)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_same_ts_in_another_workspace_still_routes(self, adapter):
+        """Slack ts values are workspace-local, so both guards are scoped.
+
+        Covers the body baseline, read while the original is still in
+        ingress, and the delivered-message registry, read once it is done.
+        """
+        gate = _IngressGate(adapter)
+        loop = asyncio.get_event_loop()
+
+        body = {
+            "text": "<@U_BOT> check the gateway logs",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "1234567890.000001",
+        }
+
+        original = loop.create_task(
+            adapter._handle_slack_message(
+                {**body, "channel_type": "channel", "team": "T123"}
+            )
+        )
+        await asyncio.wait_for(gate.entry.wait(), 5)
+
+        # Same ts and same body, other workspace — a different message.
+        other_workspace = loop.create_task(
+            adapter._handle_slack_message(
+                {
+                    "subtype": "message_changed",
+                    "channel": "C999",
+                    "channel_type": "channel",
+                    "team": "T999",
+                    "ts": "1234567891.000000",
+                    "event_ts": "1234567891.000000",
+                    "message": dict(body, channel="C999"),
+                }
+            )
+        )
+        await asyncio.wait_for(gate.second_entry.wait(), 5)
+
+        gate.release()
+        await asyncio.wait_for(asyncio.gather(original, other_workspace), 5)
+
+        assert adapter.handle_message.await_count == 2
+
+        edit = dict(body, text="<@U_BOT> and the agent log too")
+        # Delivered now, so the registry drops a later edit of the original.
+        await adapter._handle_slack_message(
+            {
+                "subtype": "message_changed",
+                "channel": "C123",
+                "channel_type": "channel",
+                "team": "T123",
+                "ts": "1234567892.000000",
+                "event_ts": "1234567892.000000",
+                "message": edit,
+            }
+        )
+
+        assert adapter.handle_message.await_count == 2
+
+        # A third workspace reusing that ts is a different message, though.
+        await adapter._handle_slack_message(
+            {
+                "subtype": "message_changed",
+                "channel": "C777",
+                "channel_type": "channel",
+                "team": "T777",
+                "ts": "1234567892.000000",
+                "event_ts": "1234567892.000000",
+                "message": dict(edit, channel="C777"),
+            }
+        )
+
+        assert adapter.handle_message.await_count == 3
+
+    @pytest.mark.asyncio
     async def test_ignored_channel_body_is_not_remembered(self, adapter):
         """The baseline is not recorded for a channel the adapter ignores."""
         adapter.config.extra = {"ignored_channels": ["C_IGN"]}

@@ -823,29 +823,50 @@ def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> st
     return f"[Slack Block Kit payload for this message]\n```json\n{payload}\n```"
 
 
+#: Keys Slack sets on an ``attachments`` entry it generated itself while
+#: unfurling a link (``is_msg_unfurl`` for a message permalink, the source URL
+#: and service name for a website preview). An author or app never sets them.
+_SLACK_GENERATED_ATTACHMENT_KEYS = (
+    "is_msg_unfurl",
+    "from_url",
+    "original_url",
+    "app_unfurl_url",
+    "service_name",
+)
+
+
+def _slack_authored_attachments(attachments: Any) -> list:
+    """Return the attachments an author or app set, dropping Slack's unfurls."""
+    return [
+        att
+        for att in attachments or []
+        if isinstance(att, dict)
+        and not any(att.get(key) for key in _SLACK_GENERATED_ATTACHMENT_KEYS)
+    ]
+
+
 def _slack_message_body_signature(message: dict) -> str:
     """Return the part of a message body the agent is shown, as one value.
 
-    The inbound path builds the agent's text from the flat ``text`` *and* the
-    Block Kit payload, so an update that rewrites a bot card while keeping a
-    static fallback text changes what the agent reads even though ``text``
-    compares equal. Link unfurls are deliberately left out: Slack attaches
-    them to the message on its own, and treating that as a body change would
-    turn its own re-emit into another turn.
+    The inbound path builds the agent's text from the flat ``text``, the Block
+    Kit payload *and* the legacy ``attachments``, so an update that rewrites a
+    bot card while keeping a static fallback text changes what the agent reads
+    even though ``text`` compares equal. Link unfurls are deliberately left
+    out: Slack attaches them to the message on its own, and treating that as a
+    body change would turn its own re-emit into another turn.
     """
     text = str((message or {}).get("text") or "")
     blocks = (message or {}).get("blocks") or []
-    if not blocks:
+    attachments = _slack_authored_attachments((message or {}).get("attachments"))
+    if not blocks and not attachments:
         return text
-    return "\n".join(
-        part
-        for part in (
-            text,
-            _extract_additional_text_from_slack_blocks(blocks, text),
-            _serialize_slack_blocks_for_agent(blocks),
-        )
-        if part
-    )
+    parts = [text]
+    if blocks:
+        parts.append(_extract_additional_text_from_slack_blocks(blocks, text))
+        parts.append(_serialize_slack_blocks_for_agent(blocks))
+    if attachments:
+        parts.append(_extract_text_from_slack_attachments(attachments))
+    return "\n".join(part for part in parts if part)
 
 
 def _slack_body_digest(body: str) -> str:
@@ -1424,14 +1445,14 @@ class SlackAdapter(BasePlatformAdapter):
         # produce a second reply. max_size bounds memory, so the long window
         # is safe.
         self._dedup = MessageDeduplicator(ttl_seconds=_slack_dedup_ttl_seconds())
-        # Original Slack message timestamps that were routed into the agent.
-        # Used to avoid duplicate responses when an already-addressed message
-        # is later edited.
+        # Workspace-scoped ids of the Slack messages that were routed into
+        # the agent. Used to avoid duplicate responses when an already-
+        # addressed message is later edited.
         self._processed_message_ts: Dict[str, float] = {}
         self._PROCESSED_MESSAGE_TS_MAX = 5000
-        # Digest of the message body last seen for a message ts, recorded
-        # before any await in _handle_slack_message. Lets the message_changed
-        # branch drop a re-emit whose body is unchanged while
+        # Digest of the message body last seen for a workspace-scoped message
+        # id, recorded before any await in _handle_slack_message. Lets the
+        # message_changed branch drop a re-emit whose body is unchanged while
         # _processed_message_ts above is still unarmed. Only the digest is
         # kept, so a rendered Block Kit payload never stays in memory.
         self._seen_message_body_digest: Dict[str, str] = {}
@@ -1600,15 +1621,17 @@ class SlackAdapter(BasePlatformAdapter):
         for old_ts in sorted(timestamps, key=cls._slack_timestamp_sort_key)[:count]:
             timestamps.discard(old_ts)
 
-    def _remember_message_body(self, ts: str, body: str) -> None:
-        """Record a digest of the body last seen for *ts* (bounded).
+    def _remember_message_body(self, message_key: str, body: str) -> None:
+        """Record a digest of the body last seen for *message_key* (bounded).
 
-        Empty bodies are skipped so that edits to messages carrying only
-        files are never treated as unchanged.
+        *message_key* is workspace-scoped (see ``_workspace_event_id``), since
+        Slack message timestamps are only unique within one workspace. Empty
+        bodies are skipped so that edits to messages carrying only files are
+        never treated as unchanged.
         """
-        if not ts or not body:
+        if not message_key or not body:
             return
-        self._seen_message_body_digest[ts] = _slack_body_digest(body)
+        self._seen_message_body_digest[message_key] = _slack_body_digest(body)
         self._trim_oldest_dict_entries(
             self._seen_message_body_digest, self._SEEN_MESSAGE_BODY_DIGEST_MAX
         )
@@ -6304,10 +6327,25 @@ class SlackAdapter(BasePlatformAdapter):
             if not isinstance(updated_message, dict):
                 return
 
-            original_message_ts = str(updated_message.get("ts") or "")
+            # Normalize the routing fields first: the checks below and the
+            # rest of the method run on this message, so the workspace id
+            # resolved from it is the one the original delivery recorded its
+            # body under.
+            normalized_event = dict(updated_message)
+            for key in ("channel", "channel_type", "team", "team_id"):
+                if not normalized_event.get(key) and event.get(key):
+                    normalized_event[key] = event.get(key)
+
+            original_message_ts = str(normalized_event.get("ts") or "")
+            # Slack message timestamps are unique only within one workspace,
+            # so both guards below look the message up under the same
+            # workspace-scoped id the delivery path records it under.
+            original_message_key = self._workspace_event_id(
+                self._event_team_id(normalized_event, payload), original_message_ts
+            )
             if (
                 original_message_ts
-                and original_message_ts in self._processed_message_ts
+                and original_message_key in self._processed_message_ts
             ):
                 # INFO, not a silent return: this guard is the ONLY thing
                 # standing between an edit/unfurl re-emit and a second turn
@@ -6322,11 +6360,11 @@ class SlackAdapter(BasePlatformAdapter):
                     _slack_event_age(original_message_ts),
                 )
                 return
-            new_message_body = _slack_message_body_signature(updated_message)
+            new_message_body = _slack_message_body_signature(normalized_event)
             if (
                 original_message_ts
                 and new_message_body
-                and self._seen_message_body_digest.get(original_message_ts)
+                and self._seen_message_body_digest.get(original_message_key)
                 == _slack_body_digest(new_message_body)
             ):
                 # Slack re-dispatches message_changed for its own metadata
@@ -6336,8 +6374,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # neither the guard above nor the dedup below stops it: the
                 # first is armed only after ingress, the second keys on
                 # _slack_changed_event_ts. An edit that changes the body —
-                # including one adding a bot mention, in the text or in the
-                # blocks — still passes.
+                # including one adding a bot mention, in the text, the blocks
+                # or an authored attachment — still passes.
                 logger.info(
                     "[Slack] dropped message_changed with unchanged body "
                     "ts=%s channel=%s age=%s",
@@ -6361,10 +6399,6 @@ class SlackAdapter(BasePlatformAdapter):
             if not changed_event_ts and original_message_ts:
                 changed_event_ts = f"{original_message_ts}:changed"
 
-            normalized_event = dict(updated_message)
-            for key in ("channel", "channel_type", "team", "team_id"):
-                if not normalized_event.get(key) and event.get(key):
-                    normalized_event[key] = event.get(key)
             if changed_event_ts:
                 normalized_event["_slack_changed_event_ts"] = changed_event_ts
             event = normalized_event
@@ -6400,18 +6434,22 @@ class SlackAdapter(BasePlatformAdapter):
             logger.info("[Slack] Ignoring message in configured ignored channel %s", channel_id)
             return
 
-        # Baseline for the unchanged-body guard above. Still ahead of the
-        # first await, so a message_changed arriving mid-ingress has
-        # something to compare against, and past the two filters that
-        # precede it — the redelivery dedup and the ignored-channel check —
-        # so neither a replay nor an ignored channel takes a slot. The
-        # sender and content filters below run after this call, so those
-        # bodies are recorded even though the event is then dropped. After
-        # normalization ``event`` is the message body, so a let-through edit
-        # becomes the new baseline.
-        self._remember_message_body(
-            str(event.get("ts") or ""), _slack_message_body_signature(event)
-        )
+        # Baseline for the unchanged-body guard above, under the same
+        # workspace-scoped key that guard reads. Still ahead of the first
+        # await, so a message_changed arriving mid-ingress has something to
+        # compare against, and past the two filters that precede it — the
+        # redelivery dedup and the ignored-channel check — so neither a
+        # replay nor an ignored channel takes a slot. The sender and content
+        # filters below run after this call, so those bodies are recorded
+        # even though the event is then dropped. After normalization
+        # ``event`` is the message body, so a let-through edit becomes the
+        # new baseline.
+        message_body_ts = str(event.get("ts") or "")
+        if message_body_ts:
+            self._remember_message_body(
+                self._workspace_event_id(dedup_team_id, message_body_ts),
+                _slack_message_body_signature(event),
+            )
 
         # Bot/app-authored message filtering (SLACK_ALLOW_BOTS / config
         # allow_bots):
@@ -7443,7 +7481,9 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
         if ts:
-            self._processed_message_ts[ts] = time.time()
+            self._processed_message_ts[
+                self._workspace_event_id(dedup_team_id, ts)
+            ] = time.time()
             if len(self._processed_message_ts) > self._PROCESSED_MESSAGE_TS_MAX:
                 newest_items = sorted(
                     self._processed_message_ts.items(),
