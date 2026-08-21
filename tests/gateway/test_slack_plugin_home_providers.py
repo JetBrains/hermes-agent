@@ -374,6 +374,25 @@ class TestSlackHomeProviderDispatch:
         adapter._app.client.views_publish.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_unknown_workspace_does_not_fall_back_to_primary_client(self):
+        adapter = _make_adapter()
+        adapter._app.client.views_publish = AsyncMock()
+
+        async def provider(*, publish_home, **_):
+            await publish_home({"type": "home", "blocks": []})
+
+        fake_mgr = MagicMock()
+        fake_mgr.get_slack_home_providers.return_value = [(provider, "dash")]
+
+        with patch("hermes_cli.plugins.get_plugin_manager", return_value=fake_mgr):
+            await adapter._handle_app_home_opened(
+                {"type": "app_home_opened", "tab": "home", "user": "U1"},
+                {"team_id": "T_UNKNOWN"},
+            )
+
+        adapter._app.client.views_publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_narrow_signature_receives_only_declared_fields(self):
         """Additive payload: narrow callbacks don't get unexpected kwargs."""
         adapter = _make_adapter()

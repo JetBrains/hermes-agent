@@ -42,10 +42,12 @@ def _build_full_manifest(
     for a Hermes deployment — users can tweak them in the Slack UI after
     pasting.
 
-    By default, this keeps Hermes on Slack's older Assistant messaging
-    experience (``assistant_view``) for backward compatibility. Pass
-    ``messaging_experience="agent"`` (``--agent-view``) to emit Slack's Agent
-    messaging experience (``agent_view`` + ``app_home_opened``). Pass
+    The generated manifest enables the App Home tab and subscribes to
+    ``app_home_opened`` for every messaging experience so plugins can publish
+    custom Home views. By default, this keeps Hermes on Slack's older
+    Assistant messaging experience (``assistant_view``) for backward
+    compatibility. Pass ``messaging_experience="agent"`` (``--agent-view``)
+    to emit Slack's Agent messaging experience (``agent_view``). Pass
     ``include_assistant=False`` or ``messaging_experience="none"``
     (``--no-assistant``) to omit Slack AI messaging features and get a flat DM
     surface where ``/help``, ``/new``, etc. work inline.
@@ -65,7 +67,7 @@ def _build_full_manifest(
 
     features = {
         "app_home": {
-            "home_tab_enabled": False,
+            "home_tab_enabled": True,
             "messages_tab_enabled": True,
             "messages_tab_read_only_enabled": False,
         },
@@ -103,6 +105,7 @@ def _build_full_manifest(
         "message.mpim",
         "reaction_added",
         "reaction_removed",
+        "app_home_opened",
     ]
 
     if messaging_experience == "assistant":
@@ -124,7 +127,7 @@ def _build_full_manifest(
         # Slack includes current viewing context in Agent DM events only after
         # this subscription is enabled; the adapter consumes that context to
         # preserve the referred channel across the agent turn.
-        bot_events.extend(["app_context_changed", "app_home_opened"])
+        bot_events.append("app_context_changed")
 
     bot_scopes.sort()
     bot_events.sort()

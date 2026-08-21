@@ -5823,6 +5823,11 @@ class SlackAdapter(BasePlatformAdapter):
             client = self._team_clients.get(team_id)
             if client is not None:
                 return client
+            logger.warning(
+                "[Slack] Refusing App Home publish for unknown workspace %s",
+                team_id,
+            )
+            return None
         app = getattr(self, "_app", None)
         return getattr(app, "client", None) if app is not None else None
 

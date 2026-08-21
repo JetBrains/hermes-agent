@@ -116,6 +116,17 @@ class TestSlackManifestArgparse:
 class TestSlackFullManifest:
     """Generated full Slack app manifest used by `hermes slack manifest`."""
 
+    @pytest.mark.parametrize("kwargs", [{}, {"include_assistant": False}])
+    def test_home_tab_and_event_are_enabled_for_all_messaging_modes(self, kwargs):
+        manifest = _build_full_manifest(
+            "Hermes", "Your Hermes agent on Slack", **kwargs
+        )
+
+        assert manifest["features"]["app_home"]["home_tab_enabled"] is True
+        assert "app_home_opened" in manifest["settings"]["event_subscriptions"][
+            "bot_events"
+        ]
+
 
 
 
@@ -141,6 +152,7 @@ class TestSlackFullManifest:
 
         # Flat DM still needs the Messages tab writable.
         assert manifest["features"]["app_home"]["messages_tab_enabled"] is True
+        assert manifest["features"]["app_home"]["home_tab_enabled"] is True
         # Slash commands and Socket Mode are independent of assistant mode.
         assert manifest["features"]["slash_commands"]
         assert manifest["settings"]["socket_mode_enabled"] is True
