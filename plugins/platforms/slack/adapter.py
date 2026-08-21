@@ -5777,8 +5777,22 @@ class SlackAdapter(BasePlatformAdapter):
     async def _handle_app_home_opened(
         self, event: dict, body: Optional[dict] = None
     ) -> None:
-        """Handle Slack Agent DM-open lifecycle events without producing replies."""
-        if event.get("tab") != "messages":
+        """Handle ``app_home_opened`` for Agent DM open and plugin Home views.
+
+        * ``tab == "messages"`` — existing Agent messaging experience
+          lifecycle (session seed + suggested prompts). No agent turn.
+        * ``tab == "home"`` — dispatch plugin-registered App Home providers
+          so they can ``views.publish`` a custom Home dashboard.
+        * any other tab — ignored (preserve prior no-op behaviour).
+
+        Provider failures are isolated and never break Socket Mode dispatch.
+        """
+        tab = event.get("tab")
+        if tab == "home":
+            await self._dispatch_slack_home_providers(event, body)
+            return
+
+        if tab != "messages":
             return
 
         context = event.get("context") or event.get("app_context") or {}
@@ -5802,6 +5816,90 @@ class SlackAdapter(BasePlatformAdapter):
             metadata["channel_id"],
             team_id=metadata["team_id"],
         )
+
+    def _resolve_home_provider_client(self, team_id: str) -> Any:
+        """Return the workspace-scoped WebClient for App Home publishing."""
+        if team_id:
+            client = self._team_clients.get(team_id)
+            if client is not None:
+                return client
+        app = getattr(self, "_app", None)
+        return getattr(app, "client", None) if app is not None else None
+
+    async def _dispatch_slack_home_providers(
+        self,
+        event: dict,
+        body: Optional[dict] = None,
+    ) -> None:
+        """Invoke plugin App Home providers for ``tab == "home"`` events.
+
+        Providers are read from the plugin manager at event time (not only
+        at connect) so deferred Slack platform loading and plugin reloads
+        both see the current registry without a second Socket Mode
+        connection. Each provider is isolated: exceptions are logged and
+        never propagated into Socket Mode dispatch.
+        """
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            providers = get_plugin_manager().get_slack_home_providers()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[Slack] Could not load plugin home providers: %s",
+                exc,
+            )
+            return
+
+        if not providers:
+            return
+
+        body = body if isinstance(body, dict) else {}
+        user_id = str(event.get("user") or event.get("user_id") or "")
+        team_id = str(self._event_team_id(event, body) or "")
+        client = self._resolve_home_provider_client(team_id)
+
+        async def publish_home(view: dict) -> Any:
+            if client is None:
+                raise RuntimeError(
+                    "No Slack client available to publish App Home "
+                    f"(team_id={team_id!r})"
+                )
+            if not user_id:
+                raise RuntimeError(
+                    "Cannot publish App Home without a user_id on the event"
+                )
+            return await client.views_publish(user_id=user_id, view=view)
+
+        # Local import keeps the adapter importable when plugins aren't loaded.
+        try:
+            from hermes_cli.plugins import PluginManager
+        except Exception:  # pragma: no cover - defensive
+            PluginManager = None  # type: ignore[misc, assignment]
+
+        for provider, plugin_name in providers:
+            try:
+                payload = {
+                    "adapter": self,
+                    "client": client,
+                    "event": event,
+                    "body": body,
+                    "user_id": user_id,
+                    "team_id": team_id,
+                    "publish_home": publish_home,
+                }
+                if PluginManager is not None:
+                    result = PluginManager._invoke_hook_callback(provider, payload)
+                else:  # pragma: no cover - defensive
+                    result = provider(**payload)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                logger.error(
+                    "[Slack] Plugin '%s' home provider raised: %s",
+                    plugin_name,
+                    exc,
+                    exc_info=True,
+                )
 
     # Common reaction names → unicode emoji. Used by ``_handle_slack_reaction``
     # so skills that match on ``text`` see the same character whether the user

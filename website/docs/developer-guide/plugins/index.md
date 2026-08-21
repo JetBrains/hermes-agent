@@ -1256,6 +1256,59 @@ def register(ctx):
 
 This is the public way for plugins to participate in Slack interactivity. Older plugins may patch `SlackAdapter.connect`; prefer this API instead.
 
+### Publish a custom Slack App Home
+
+Plugins that own a Slack App Home dashboard can register a provider that publishes the Home view when a user opens the Home tab — no monkey-patching of `SlackAdapter._handle_app_home_opened` required.
+
+```python
+def register(ctx):
+    async def _home(*, client, user_id, team_id, publish_home, event, **_):
+        # client is the workspace-specific WebClient (multi-workspace safe).
+        # publish_home is a thin helper around client.views_publish.
+        await publish_home({
+            "type": "home",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Welcome* — workspace `{team_id}`",
+                    },
+                }
+            ],
+        })
+
+    ctx.register_slack_home_provider(_home)
+```
+
+**Signature:** `ctx.register_slack_home_provider(provider) -> PluginRegistration`
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `provider` | callable (sync or async) | Keyword payload (additive, same rules as hooks). Prefer `**kwargs`. |
+
+**Provider keyword fields:**
+
+| Field | Description |
+|-------|-------------|
+| `adapter` | Live `SlackAdapter` instance |
+| `client` | Workspace-specific Slack WebClient for this event's `team_id` |
+| `event` | Inner `app_home_opened` event dict |
+| `body` | Outer Events API / Bolt envelope |
+| `user_id` | Slack user that opened Home |
+| `team_id` | Workspace / team id |
+| `publish_home` | `async (view: dict) -> Any` — calls `client.views_publish(user_id=..., view=view)` |
+
+**Runtime behavior:**
+
+- Providers are queued at plugin-load time and looked up when `app_home_opened` fires with `tab == "home"`. Deferred Slack platform loading and plugin reloads both see the current registry — no second Socket Mode connection.
+- Existing Hermes behaviour for `tab == "messages"` (Agent DM open / suggested prompts) and other non-home tabs is unchanged; providers are not invoked for those tabs.
+- Each provider is wrapped defensively: if it raises, the gateway logs the error and continues Socket Mode dispatch.
+- Multi-workspace installs receive the correct workspace client via `team_id` routing; use `publish_home` or `client.views_publish` rather than a process-global client.
+- Interactive Block Kit actions on the Home view continue to use [`register_slack_action_handler`](#handle-slack-block-kit-button-clicks).
+
+This is the public way for plugins to publish a custom App Home. Older plugins may patch `SlackAdapter._handle_app_home_opened`; prefer this API instead.
+
 :::tip
 This guide covers **general plugins** (tools, hooks, slash commands, CLI commands). The sections below sketch the authoring pattern for each specialized plugin type; each links to its full guide for field reference and examples.
 :::
