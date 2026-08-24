@@ -183,8 +183,9 @@ def slack_manifest_command(args) -> int:
                       DMs render as a flat chat where bare slash commands
                       work inline instead of the Assistant thread pane.
       --agent-view    Use Slack's Agent messaging experience (agent_view,
-                      app_home_opened + message.im) instead of the legacy
-                      Assistant messaging experience.
+                      app_context_changed) instead of the legacy Assistant
+                      messaging experience. The Home tab and app_home_opened
+                      are enabled for every messaging mode.
     """
     name = getattr(args, "name", None) or "Hermes"
     description = getattr(args, "description", None) or "Your Hermes agent on Slack"

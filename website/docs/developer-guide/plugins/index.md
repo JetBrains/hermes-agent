@@ -1303,6 +1303,7 @@ def register(ctx):
 
 - Providers are queued at plugin-load time and looked up when `app_home_opened` fires with `tab == "home"`. Deferred Slack platform loading and plugin reloads both see the current registry — no second Socket Mode connection.
 - Existing Hermes behaviour for `tab == "messages"` (Agent DM open / suggested prompts) and other non-home tabs is unchanged; providers are not invoked for those tabs.
+- Providers run only for users permitted by Hermes' existing Slack interactive-user authorization gate.
 - Each provider is wrapped defensively: if it raises, the gateway logs the error and continues Socket Mode dispatch.
 - Multi-workspace installs receive the correct workspace client via `team_id` routing; use `publish_home` or `client.views_publish` rather than a process-global client.
 - Interactive Block Kit actions on the Home view continue to use [`register_slack_action_handler`](#handle-slack-block-kit-button-clicks).

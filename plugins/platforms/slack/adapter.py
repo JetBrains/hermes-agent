@@ -5847,7 +5847,8 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             from hermes_cli.plugins import get_plugin_manager
 
-            providers = get_plugin_manager().get_slack_home_providers()
+            manager = get_plugin_manager()
+            providers = manager.get_slack_home_providers()
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(
                 "[Slack] Could not load plugin home providers: %s",
@@ -5861,6 +5862,15 @@ class SlackAdapter(BasePlatformAdapter):
         body = body if isinstance(body, dict) else {}
         user_id = str(event.get("user") or event.get("user_id") or "")
         team_id = str(self._event_team_id(event, body) or "")
+        if not self._is_interactive_user_authorized(user_id, team_id=team_id):
+            logger.warning(
+                "[Slack] Ignoring App Home open from unauthorized user %s "
+                "(team=%s)",
+                user_id,
+                team_id,
+            )
+            return
+
         client = self._resolve_home_provider_client(team_id)
 
         async def publish_home(view: dict) -> Any:
@@ -5875,27 +5885,19 @@ class SlackAdapter(BasePlatformAdapter):
                 )
             return await client.views_publish(user_id=user_id, view=view)
 
-        # Local import keeps the adapter importable when plugins aren't loaded.
-        try:
-            from hermes_cli.plugins import PluginManager
-        except Exception:  # pragma: no cover - defensive
-            PluginManager = None  # type: ignore[misc, assignment]
+        payload = {
+            "adapter": self,
+            "client": client,
+            "event": event,
+            "body": body,
+            "user_id": user_id,
+            "team_id": team_id,
+            "publish_home": publish_home,
+        }
 
         for provider, plugin_name in providers:
             try:
-                payload = {
-                    "adapter": self,
-                    "client": client,
-                    "event": event,
-                    "body": body,
-                    "user_id": user_id,
-                    "team_id": team_id,
-                    "publish_home": publish_home,
-                }
-                if PluginManager is not None:
-                    result = PluginManager._invoke_hook_callback(provider, payload)
-                else:  # pragma: no cover - defensive
-                    result = provider(**payload)
+                result = manager._invoke_hook_callback(provider, payload)
                 if inspect.isawaitable(result):
                     await result
             except Exception as exc:

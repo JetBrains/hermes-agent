@@ -94,7 +94,17 @@ def _make_adapter() -> SlackAdapter:
     adapter._app.client = AsyncMock()
     adapter._team_clients = {}
     adapter._team_bot_user_ids = {}
+    # Individual tests override this to exercise the authorization boundary.
+    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
     return adapter
+
+
+def _fake_manager(providers) -> MagicMock:
+    """Build a fake manager that retains the real narrow-signature behavior."""
+    manager = MagicMock()
+    manager.get_slack_home_providers.return_value = providers
+    manager._invoke_hook_callback = PluginManager._invoke_hook_callback
+    return manager
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +194,7 @@ class TestSlackHomeProviderDispatch:
                 }
             )
 
-        fake_mgr = MagicMock()
-        fake_mgr.get_slack_home_providers.return_value = [(provider, "dash")]
+        fake_mgr = _fake_manager([(provider, "dash")])
 
         event = {
             "type": "app_home_opened",
@@ -216,6 +225,31 @@ class TestSlackHomeProviderDispatch:
         )
 
     @pytest.mark.asyncio
+    async def test_unauthorized_user_does_not_invoke_provider_or_publish(self):
+        adapter = _make_adapter()
+        adapter._is_interactive_user_authorized.return_value = False
+        client = AsyncMock()
+        client.views_publish = AsyncMock(return_value={"ok": True})
+        adapter._team_clients["T_WS"] = client
+
+        provider = AsyncMock()
+        fake_mgr = _fake_manager([(provider, "dash")])
+        event = {
+            "type": "app_home_opened",
+            "tab": "home",
+            "user": "U_UNAUTHORIZED",
+        }
+
+        with patch("hermes_cli.plugins.get_plugin_manager", return_value=fake_mgr):
+            await adapter._handle_app_home_opened(event, {"team_id": "T_WS"})
+
+        adapter._is_interactive_user_authorized.assert_called_once_with(
+            "U_UNAUTHORIZED", team_id="T_WS"
+        )
+        provider.assert_not_awaited()
+        client.views_publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_messages_tab_does_not_invoke_provider(self):
         adapter = _make_adapter()
         adapter._set_assistant_suggested_prompts = AsyncMock()
@@ -223,8 +257,7 @@ class TestSlackHomeProviderDispatch:
         adapter._cache_agent_view_context = MagicMock()
 
         provider = AsyncMock()
-        fake_mgr = MagicMock()
-        fake_mgr.get_slack_home_providers.return_value = [(provider, "dash")]
+        fake_mgr = _fake_manager([(provider, "dash")])
 
         event = {
             "type": "app_home_opened",
@@ -247,8 +280,7 @@ class TestSlackHomeProviderDispatch:
         adapter = _make_adapter()
         adapter._set_assistant_suggested_prompts = AsyncMock()
         provider = AsyncMock()
-        fake_mgr = MagicMock()
-        fake_mgr.get_slack_home_providers.return_value = [(provider, "dash")]
+        fake_mgr = _fake_manager([(provider, "dash")])
 
         event = {"type": "app_home_opened", "tab": "about", "user": "U_USER"}
 
@@ -276,11 +308,10 @@ class TestSlackHomeProviderDispatch:
         client = adapter._team_clients["T1"]
         client.views_publish = AsyncMock(return_value={"ok": True})
 
-        fake_mgr = MagicMock()
-        fake_mgr.get_slack_home_providers.return_value = [
+        fake_mgr = _fake_manager([
             (boom, "bad_plugin"),
             (ok, "good_plugin"),
-        ]
+        ])
 
         event = {"type": "app_home_opened", "tab": "home", "user": "U1"}
         body = {"team_id": "T1"}
@@ -313,7 +344,7 @@ class TestSlackHomeProviderDispatch:
 
         # Simulate "no providers at connect time".
         live_providers: list = []
-        fake_mgr = MagicMock()
+        fake_mgr = _fake_manager([])
         fake_mgr.get_slack_home_providers.side_effect = lambda: list(live_providers)
 
         event = {"type": "app_home_opened", "tab": "home", "user": "U1"}
@@ -349,8 +380,7 @@ class TestSlackHomeProviderDispatch:
             seen_clients.append(client)
             await publish_home({"type": "home", "blocks": []})
 
-        fake_mgr = MagicMock()
-        fake_mgr.get_slack_home_providers.return_value = [(provider, "dash")]
+        fake_mgr = _fake_manager([(provider, "dash")])
 
         with patch("hermes_cli.plugins.get_plugin_manager", return_value=fake_mgr):
             await adapter._handle_app_home_opened(
@@ -381,8 +411,7 @@ class TestSlackHomeProviderDispatch:
         async def provider(*, publish_home, **_):
             await publish_home({"type": "home", "blocks": []})
 
-        fake_mgr = MagicMock()
-        fake_mgr.get_slack_home_providers.return_value = [(provider, "dash")]
+        fake_mgr = _fake_manager([(provider, "dash")])
 
         with patch("hermes_cli.plugins.get_plugin_manager", return_value=fake_mgr):
             await adapter._handle_app_home_opened(
@@ -404,8 +433,7 @@ class TestSlackHomeProviderDispatch:
             received["user_id"] = user_id
             received["team_id"] = team_id
 
-        fake_mgr = MagicMock()
-        fake_mgr.get_slack_home_providers.return_value = [(narrow, "dash")]
+        fake_mgr = _fake_manager([(narrow, "dash")])
 
         with patch("hermes_cli.plugins.get_plugin_manager", return_value=fake_mgr):
             await adapter._handle_app_home_opened(
