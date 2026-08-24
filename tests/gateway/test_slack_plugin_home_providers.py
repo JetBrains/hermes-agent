@@ -61,7 +61,7 @@ _ensure_slack_mock()
 import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
 _slack_mod.SLACK_AVAILABLE = True
 
-from gateway.config import PlatformConfig  # noqa: E402
+from gateway.config import GatewayConfig, Platform, PlatformConfig  # noqa: E402
 from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
 
 from hermes_cli.plugins import (  # noqa: E402
@@ -238,16 +238,93 @@ class TestSlackHomeProviderDispatch:
             "type": "app_home_opened",
             "tab": "home",
             "user": "U_UNAUTHORIZED",
+            "channel": "DHOME1",
         }
 
         with patch("hermes_cli.plugins.get_plugin_manager", return_value=fake_mgr):
             await adapter._handle_app_home_opened(event, {"team_id": "T_WS"})
 
         adapter._is_interactive_user_authorized.assert_called_once_with(
-            "U_UNAUTHORIZED", team_id="T_WS"
+            "U_UNAUTHORIZED", channel_id="DHOME1", team_id="T_WS"
         )
         provider.assert_not_awaited()
         client.views_publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_home_auth_uses_dm_allowlist_instead_of_group_allowlist(
+        self, monkeypatch
+    ):
+        """A DM Home open must use ``allow_from``, not ``group_allow_from``."""
+        for name in (
+            "SLACK_ALLOWED_USERS",
+            "GATEWAY_ALLOWED_USERS",
+            "SLACK_ALLOW_ALL_USERS",
+            "GATEWAY_ALLOW_ALL_USERS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        config = PlatformConfig(
+            enabled=True,
+            token="xoxb-fake",
+            extra={
+                "allow_from": ["U_DM_ALLOWED"],
+                "group_allow_from": ["U_GROUP_ONLY"],
+            },
+        )
+        adapter = SlackAdapter(config)
+        adapter._app = MagicMock()
+        adapter._app.client = AsyncMock()
+        team_client = AsyncMock()
+        adapter._team_clients = {"T_WS": team_client}
+        adapter._team_bot_user_ids = {}
+
+        from gateway.run import GatewayRunner
+
+        seen_sources = []
+
+        class RecordingGatewayRunner(GatewayRunner):
+            def _is_user_authorized(self, source, **kwargs):
+                seen_sources.append(source)
+                return super()._is_user_authorized(source, **kwargs)
+
+        runner = object.__new__(RecordingGatewayRunner)
+        runner.config = GatewayConfig(platforms={Platform.SLACK: config})
+        runner.adapters = {Platform.SLACK: adapter}
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+        adapter._message_handler = runner._is_user_authorized
+
+        calls = []
+
+        async def provider(**_kwargs):
+            calls.append(True)
+
+        fake_mgr = _fake_manager([(provider, "dash")])
+        body = {"team_id": "T_WS"}
+
+        with patch("hermes_cli.plugins.get_plugin_manager", return_value=fake_mgr):
+            await adapter._handle_app_home_opened(
+                {
+                    "type": "app_home_opened",
+                    "tab": "home",
+                    "user": "U_DM_ALLOWED",
+                    "channel": "DHOME1",
+                },
+                body,
+            )
+            await adapter._handle_app_home_opened(
+                {
+                    "type": "app_home_opened",
+                    "tab": "home",
+                    "user": "U_GROUP_ONLY",
+                    "channel": "DHOME1",
+                },
+                body,
+            )
+
+        assert [source.chat_type for source in seen_sources] == ["dm", "dm"]
+        assert [source.chat_id for source in seen_sources] == ["DHOME1", "DHOME1"]
+        assert calls == [True]
 
     @pytest.mark.asyncio
     async def test_messages_tab_does_not_invoke_provider(self):

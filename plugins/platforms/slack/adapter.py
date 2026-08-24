@@ -5862,7 +5862,10 @@ class SlackAdapter(BasePlatformAdapter):
         body = body if isinstance(body, dict) else {}
         user_id = str(event.get("user") or event.get("user_id") or "")
         team_id = str(self._event_team_id(event, body) or "")
-        if not self._is_interactive_user_authorized(user_id, team_id=team_id):
+        channel_id = str(event.get("channel") or event.get("channel_id") or "")
+        if not self._is_interactive_user_authorized(
+            user_id, channel_id=channel_id, team_id=team_id
+        ):
             logger.warning(
                 "[Slack] Ignoring App Home open from unauthorized user %s "
                 "(team=%s)",

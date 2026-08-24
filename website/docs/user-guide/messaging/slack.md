@@ -285,9 +285,6 @@ hermes slack manifest --agent-view --home-tab --write
 
 `--home-tab` enables the Home tab and subscribes to `app_home_opened`; without
 it, provider registration alone does not change the static Slack manifest.
-Junie-Live and the yana App Home smoke setup must include `--home-tab` (or
-enable the equivalent Home tab and event subscription in Slack) when generating
-their manifest.
 
 New Slack apps use Slack's **Agent** messaging experience. Existing Hermes
 Assistant apps can migrate by regenerating the manifest with `--agent-view`:
