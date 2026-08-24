@@ -1283,6 +1283,13 @@ def register(ctx):
 
 **Signature:** `ctx.register_slack_home_provider(provider) -> PluginRegistration`
 
+The provider is a runtime integration, so the Slack app manifest must also
+deliver `app_home_opened`. For a generated manifest, use
+`hermes slack manifest --home-tab --write` (and add `--agent-view` when using
+Slack's Agent messaging experience); alternatively enable the Home tab and
+event subscription in the Slack app configuration. Provider registration alone
+does not alter a static manifest.
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `provider` | callable (sync or async) | Keyword payload (additive, same rules as hooks). Prefer `**kwargs`. |

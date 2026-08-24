@@ -73,6 +73,12 @@ def build_slack_parser(subparsers, *, cmd_slack: Callable) -> None:
         help="Emit only the features.slash_commands array (for merging "
         "into an existing manifest manually).",
     )
+    slack_manifest.add_argument(
+        "--home-tab",
+        action="store_true",
+        help="Enable Slack's App Home tab and subscribe to app_home_opened "
+        "so a registered Home provider can publish a custom view.",
+    )
     slack_messaging = slack_manifest.add_mutually_exclusive_group()
     slack_messaging.add_argument(
         "--no-assistant",
@@ -87,8 +93,9 @@ def build_slack_parser(subparsers, *, cmd_slack: Callable) -> None:
         action="store_true",
         help="Emit Slack's Agent messaging experience (agent_view and "
         "app_context_changed) instead of the legacy assistant_view "
-        "experience. The Home tab and app_home_opened are enabled for every "
-        "messaging mode. This changes Slack's app messaging surface and "
-        "cannot be reversed in Slack after applying the manifest.",
+        "experience. Agent mode retains its app_home_opened Messages-tab "
+        "lifecycle; use --home-tab to enable Home chrome. This changes "
+        "Slack's app messaging surface and cannot be reversed in Slack "
+        "after applying the manifest.",
     )
     slack_parser.set_defaults(func=cmd_slack)

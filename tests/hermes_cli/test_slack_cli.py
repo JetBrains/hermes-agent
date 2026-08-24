@@ -75,9 +75,6 @@ class TestSlackManifestConsoleExitStatus:
 class TestSlackManifestArgparse:
     """Slack manifest messaging-experience flags wire through argparse."""
 
-
-
-
     def test_long_description_file_preserves_newlines(self, tmp_path, capsys):
         content = ("x" * 175) + "\r\n" + ("y" * 175) + "\r"
         source = tmp_path / "AGENTS.md"
@@ -112,20 +109,52 @@ class TestSlackManifestArgparse:
         assert "cannot read long description" in captured.err
         assert source in captured.err
 
+    def test_home_tab_flag_enables_home_and_event(self, capsys):
+        args = _parse_slack_args(["slack", "manifest", "--home-tab"])
 
-class TestSlackFullManifest:
-    """Generated full Slack app manifest used by `hermes slack manifest`."""
+        assert slack_manifest_command(args) == 0
 
-    @pytest.mark.parametrize("kwargs", [{}, {"include_assistant": False}])
-    def test_home_tab_and_event_are_enabled_for_all_messaging_modes(self, kwargs):
-        manifest = _build_full_manifest(
-            "Hermes", "Your Hermes agent on Slack", **kwargs
-        )
-
+        manifest = json.loads(capsys.readouterr().out)
         assert manifest["features"]["app_home"]["home_tab_enabled"] is True
         assert "app_home_opened" in manifest["settings"]["event_subscriptions"][
             "bot_events"
         ]
+
+
+class TestSlackFullManifest:
+    """Generated full Slack app manifest used by `hermes slack manifest`."""
+
+    @pytest.mark.parametrize(
+        ("kwargs", "has_home_event"),
+        [
+            ({}, False),
+            ({"include_assistant": False}, False),
+            ({"messaging_experience": "agent"}, True),
+        ],
+    )
+    def test_home_tab_is_off_by_default_and_agent_lifecycle_is_preserved(
+        self, kwargs, has_home_event
+    ):
+        manifest = _build_full_manifest(
+            "Hermes", "Your Hermes agent on Slack", **kwargs
+        )
+
+        assert manifest["features"]["app_home"]["home_tab_enabled"] is False
+        bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
+        assert ("app_home_opened" in bot_events) is has_home_event
+
+    @pytest.mark.parametrize("messaging_experience", ["assistant", "none", "agent"])
+    def test_home_tab_opt_in_enables_home_and_event(self, messaging_experience):
+        manifest = _build_full_manifest(
+            "Hermes",
+            "Your Hermes agent on Slack",
+            messaging_experience=messaging_experience,
+            home_tab=True,
+        )
+
+        assert manifest["features"]["app_home"]["home_tab_enabled"] is True
+        bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
+        assert bot_events.count("app_home_opened") == 1
 
 
 
@@ -140,6 +169,7 @@ class TestSlackFullManifest:
         assert "assistant:write" in manifest["oauth_config"]["scopes"]["bot"]
         bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
         assert "assistant_thread_started" in bot_events
+        assert "app_home_opened" not in bot_events
 
 
 
@@ -152,7 +182,7 @@ class TestSlackFullManifest:
 
         # Flat DM still needs the Messages tab writable.
         assert manifest["features"]["app_home"]["messages_tab_enabled"] is True
-        assert manifest["features"]["app_home"]["home_tab_enabled"] is True
+        assert manifest["features"]["app_home"]["home_tab_enabled"] is False
         # Slash commands and Socket Mode are independent of assistant mode.
         assert manifest["features"]["slash_commands"]
         assert manifest["settings"]["socket_mode_enabled"] is True
@@ -163,5 +193,6 @@ class TestSlackFullManifest:
         bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
         for event in ("message.im", "message.channels", "message.groups", "app_mention"):
             assert event in bot_events
+        assert "app_home_opened" not in bot_events
 
 
