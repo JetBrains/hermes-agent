@@ -12,6 +12,8 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
+- GET  /api/communications             — sanitized gateway communication rows (People/console)
+- GET  /api/costs/summary              — best-effort daily/last-day/last-week cost rollups
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
@@ -2063,6 +2065,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
+            ("GET", "/api/communications", self._handle_list_communications),
+            ("GET", "/api/costs/summary", self._handle_costs_summary),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
@@ -3165,6 +3169,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
+                "communications": {"method": "GET", "path": "/api/communications"},
+                "costs_summary": {"method": "GET", "path": "/api/costs/summary"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
@@ -3377,6 +3383,229 @@ class APIServerAdapter(BasePlatformAdapter):
             "offset": offset,
             "has_more": windowed >= limit,
         })
+
+    @staticmethod
+    def _communication_response(session: Dict[str, Any]) -> Dict[str, Any]:
+        """Return an allowlisted gateway-communication row for console People views.
+
+        Intentionally omits ``origin_json``, system prompts, model config, and
+        other internal session fields that ``_session_response`` also withholds.
+        """
+        ended_at = session.get("ended_at")
+        message_count = session.get("message_count")
+        try:
+            message_count_i = int(message_count or 0)
+        except (TypeError, ValueError):
+            message_count_i = 0
+        return {
+            "id": session.get("id"),
+            "source": session.get("source"),
+            "user_id": session.get("user_id"),
+            "display_name": session.get("display_name"),
+            "chat_id": session.get("chat_id"),
+            "chat_type": session.get("chat_type"),
+            "thread_id": session.get("thread_id"),
+            "session_key": session.get("session_key"),
+            "message_count": message_count_i,
+            "started_at": session.get("started_at"),
+            "ended_at": ended_at,
+            "last_active": session.get("last_active"),
+            "active": ended_at is None,
+        }
+
+    async def _handle_list_communications(self, request: "web.Request") -> "web.Response":
+        """GET /api/communications — sanitized gateway session/communication rows.
+
+        Query params:
+          - ``source``: optional platform filter (e.g. ``slack``); matches SessionDB
+            ``list_gateway_sessions(platform=...)``.
+          - ``active_only``: when true, only open sessions; default false so People
+            can show finished interactions as well as active ones.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+
+        source = request.query.get("source") or None
+        # Default false: console People needs active + finished rows.
+        active_only = _coerce_request_bool(request.query.get("active_only"), default=False)
+
+        rows = await asyncio.to_thread(
+            db.list_gateway_sessions,
+            platform=source,
+            active_only=active_only,
+        )
+        return web.json_response({
+            "object": "list",
+            "data": [self._communication_response(row) for row in rows],
+            "source": source,
+            "active_only": active_only,
+        })
+
+    @staticmethod
+    def _cost_bucket_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize one daily SQL aggregate into a stable cost bucket."""
+        def _num(key: str, default: float = 0.0):
+            val = row.get(key)
+            if val is None:
+                return default
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return default
+
+        def _int(key: str) -> int:
+            val = row.get(key)
+            try:
+                return int(val or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        # SUM(actual_cost_usd) is SQL NULL when every contributing row is NULL.
+        actual_raw = row.get("actual_cost_usd")
+        actual = None if actual_raw is None else _num("actual_cost_usd")
+        estimated = _num("estimated_cost_usd")
+        bucket: Dict[str, Any] = {
+            "estimated_cost_usd": estimated,
+            "actual_cost_usd": actual,
+            "sessions": _int("sessions"),
+            "input_tokens": _int("input_tokens"),
+            "output_tokens": _int("output_tokens"),
+            "api_calls": _int("api_calls"),
+        }
+        if "day" in row and row.get("day") is not None:
+            bucket["day"] = str(row.get("day"))
+        return bucket
+
+    @classmethod
+    def _rollup_cost_buckets(cls, buckets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Sum daily buckets into a window rollup. Empty input → None (not fake zero)."""
+        if not buckets:
+            return None
+        estimated = 0.0
+        actual_sum = 0.0
+        actual_seen = False
+        sessions = 0
+        input_tokens = 0
+        output_tokens = 0
+        api_calls = 0
+        for b in buckets:
+            estimated += float(b.get("estimated_cost_usd") or 0.0)
+            if b.get("actual_cost_usd") is not None:
+                actual_seen = True
+                actual_sum += float(b.get("actual_cost_usd") or 0.0)
+            sessions += int(b.get("sessions") or 0)
+            input_tokens += int(b.get("input_tokens") or 0)
+            output_tokens += int(b.get("output_tokens") or 0)
+            api_calls += int(b.get("api_calls") or 0)
+        return {
+            "estimated_cost_usd": estimated,
+            "actual_cost_usd": actual_sum if actual_seen else None,
+            "sessions": sessions,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "api_calls": api_calls,
+        }
+
+    def _query_costs_summary(self, db: Any, days: int) -> Dict[str, Any]:
+        """Best-effort cost windows grouped by session ``started_at`` calendar day (UTC).
+
+        Mirrors the dashboard ``_get_usage_analytics`` daily GROUP BY pattern.
+        Long-lived sessions spanning midnight are attributed entirely to the
+        day they started — label responses with ``basis`` accordingly.
+        """
+        import time
+        from datetime import datetime, timedelta, timezone
+
+        # Drain async token/cost deltas so rollups match SessionDB counters.
+        flush = getattr(db, "flush_token_counts", None)
+        if callable(flush):
+            flush()
+
+        days = max(1, min(int(days), 365))
+        now = time.time()
+        cutoff = now - (days * 86400)
+        with db._lock:
+            cur = db._conn.execute(
+                """
+                SELECT date(started_at, 'unixepoch') AS day,
+                       SUM(COALESCE(input_tokens, 0)) AS input_tokens,
+                       SUM(COALESCE(output_tokens, 0)) AS output_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                       SUM(actual_cost_usd) AS actual_cost_usd,
+                       COUNT(*) AS sessions,
+                       SUM(COALESCE(api_call_count, 0)) AS api_calls
+                FROM sessions
+                WHERE started_at > ?
+                GROUP BY day
+                ORDER BY day
+                """,
+                (cutoff,),
+            )
+            daily_rows = [dict(r) for r in cur.fetchall()]
+
+        daily = [self._cost_bucket_from_row(r) for r in daily_rows]
+
+        today = datetime.now(timezone.utc).date()
+        week_start = (today - timedelta(days=6)).isoformat()
+        today_s = today.isoformat()
+
+        # last_day: most recent calendar day with activity in-window (not a fake $0 day).
+        last_day = daily[-1] if daily else None
+        last_week_days = [b for b in daily if str(b.get("day") or "") >= week_start]
+        # If the window is shorter than a week, last_week still reflects available days.
+        last_week = self._rollup_cost_buckets(last_week_days)
+        totals = self._rollup_cost_buckets(daily)
+
+        return {
+            "object": "hermes.costs.summary",
+            "days": days,
+            "daily": daily,
+            "last_day": last_day,
+            "last_week": last_week,
+            "totals": totals,
+            "basis": "session_started_at_day",
+            "currency": "USD",
+            "note": (
+                "Best-effort rollup: session lifetime cost is attributed to the "
+                "UTC calendar day of sessions.started_at. Prefer actual_cost_usd "
+                "when present; otherwise estimated_cost_usd. Empty windows are "
+                "null/empty rather than fabricated zeros."
+            ),
+            # today retained for clients that want an explicit "today" probe
+            "as_of_day": today_s,
+        }
+
+    async def _handle_costs_summary(self, request: "web.Request") -> "web.Response":
+        """GET /api/costs/summary — best-effort daily + last-day + last-week spend.
+
+        Query params:
+          - ``days``: lookback window (default 7, clamped 1..365).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+
+        days = self._parse_nonnegative_int(request.query.get("days"), default=7, maximum=365)
+        if days < 1:
+            days = 7
+
+        payload = await asyncio.to_thread(self._query_costs_summary, db, days)
+        return web.json_response(payload)
 
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions -- create an empty Hermes session row.
