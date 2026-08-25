@@ -264,7 +264,27 @@ Step 1, Option A) that declares every command in
 as a slash command. In Socket Mode, Slack routes the command event
 through the WebSocket regardless of the manifest's `url` field.
 
-### Agent messaging experience
+### App Home and Agent messaging experience
+
+Generated manifests preserve the existing Slack surface by default: the Home
+tab is disabled, and default Assistant or flat-DM manifests do not subscribe to
+`app_home_opened`. A plugin can use the public
+[`register_slack_home_provider`](../../developer-guide/plugins/index.md#publish-a-custom-slack-app-home)
+API to publish a complete Home view, but the manifest must opt in to delivering
+the event:
+
+```bash
+hermes slack manifest --home-tab --write
+```
+
+For a Slack Agent app that also uses the provider, combine the flags:
+
+```bash
+hermes slack manifest --agent-view --home-tab --write
+```
+
+`--home-tab` enables the Home tab and subscribes to `app_home_opened`; without
+it, provider registration alone does not change the static Slack manifest.
 
 New Slack apps use Slack's **Agent** messaging experience. Existing Hermes
 Assistant apps can migrate by regenerating the manifest with `--agent-view`:
@@ -275,11 +295,14 @@ hermes slack manifest --agent-view --write
 
 Update the manifest in **Features → App Manifest**, then reinstall the app if
 Slack asks. Agent view cannot be reverted to Assistant view, and users may need
-to hard-refresh Slack after the switch. The generated Agent manifest subscribes
-to `message.im`, `app_home_opened`, and `app_context_changed`, so Hermes can
-identify a Messages-tab DM and receive the user's active Slack context with a
-turn. Hermes only supplies that context as a label; it does not read the viewed
-channel's history.
+to hard-refresh Slack after the switch. The Agent-specific manifest additions
+are `agent_view` and `app_context_changed`; `message.im` remains part of the
+base messaging subscription. Agent manifests also retain the
+`app_home_opened` subscription used by the Messages-tab lifecycle, but this
+does not enable the Home tab; add `--home-tab` when a Home provider is needed.
+Hermes uses `app_context_changed` to identify the user's active Slack context
+with a turn. Hermes only supplies that context as a label; it does not read the
+viewed channel's history.
 
 ### Refreshing slash commands after updates
 

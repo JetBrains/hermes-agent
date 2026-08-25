@@ -33,6 +33,7 @@ def _build_full_manifest(
     include_assistant: bool = True,
     messaging_experience: str | None = None,
     long_description: str | None = None,
+    home_tab: bool = False,
 ) -> dict:
     """Build a full Slack manifest merging display info + our slash list.
 
@@ -42,13 +43,18 @@ def _build_full_manifest(
     for a Hermes deployment — users can tweak them in the Slack UI after
     pasting.
 
-    By default, this keeps Hermes on Slack's older Assistant messaging
-    experience (``assistant_view``) for backward compatibility. Pass
+    The App Home tab is opt-in via ``home_tab=True`` (the
+    ``--home-tab`` CLI flag). This preserves the pre-existing manifest for
+    installations that do not use an App Home provider. By default, this
+    keeps Hermes on Slack's older Assistant messaging experience
+    (``assistant_view``) for backward compatibility. Pass
     ``messaging_experience="agent"`` (``--agent-view``) to emit Slack's Agent
-    messaging experience (``agent_view`` + ``app_home_opened``). Pass
-    ``include_assistant=False`` or ``messaging_experience="none"``
-    (``--no-assistant``) to omit Slack AI messaging features and get a flat DM
-    surface where ``/help``, ``/new``, etc. work inline.
+    messaging experience (``agent_view``); Agent mode also subscribes to
+    ``app_home_opened`` for its existing Messages-tab lifecycle, without
+    enabling Home chrome. Pass ``include_assistant=False`` or
+    ``messaging_experience="none"`` (``--no-assistant``) to omit Slack AI
+    messaging features and get a flat DM surface where ``/help``, ``/new``,
+    etc. work inline.
     """
     from hermes_cli.commands import slack_app_manifest
 
@@ -65,7 +71,7 @@ def _build_full_manifest(
 
     features = {
         "app_home": {
-            "home_tab_enabled": False,
+            "home_tab_enabled": bool(home_tab),
             "messages_tab_enabled": True,
             "messages_tab_read_only_enabled": False,
         },
@@ -126,6 +132,9 @@ def _build_full_manifest(
         # preserve the referred channel across the agent turn.
         bot_events.extend(["app_context_changed", "app_home_opened"])
 
+    if home_tab and "app_home_opened" not in bot_events:
+        bot_events.append("app_home_opened")
+
     bot_scopes.sort()
     bot_events.sort()
 
@@ -175,13 +184,18 @@ def slack_manifest_command(args) -> int:
       --long-description-file PATH  Read the long app description from a UTF-8 file
       --slashes-only  Emit only the ``features.slash_commands`` array (for
                       merging into an existing manifest manually)
+      --home-tab      Enable Slack's App Home tab and subscribe to
+                      ``app_home_opened`` so a registered Home provider can
+                      publish a custom view.
       --no-assistant  Omit Slack AI Assistant mode (assistant_view feature,
                       assistant:write scope, assistant_thread_* events) so
                       DMs render as a flat chat where bare slash commands
                       work inline instead of the Assistant thread pane.
       --agent-view    Use Slack's Agent messaging experience (agent_view,
-                      app_home_opened + message.im) instead of the legacy
-                      Assistant messaging experience.
+                      app_context_changed) instead of the legacy Assistant
+                      messaging experience. Agent mode retains its
+                      app_home_opened Messages-tab lifecycle; use
+                      ``--home-tab`` to enable Home chrome.
     """
     name = getattr(args, "name", None) or "Hermes"
     description = getattr(args, "description", None) or "Your Hermes agent on Slack"
@@ -248,6 +262,7 @@ def slack_manifest_command(args) -> int:
             description,
             messaging_experience=messaging_experience,
             long_description=long_description,
+            home_tab=getattr(args, "home_tab", False),
         )
 
     payload = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"

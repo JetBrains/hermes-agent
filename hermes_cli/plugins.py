@@ -2927,6 +2927,85 @@ class PluginContext:
         )
         return handle
 
+    # -- slack App Home provider registration -------------------------------
+
+    def register_slack_home_provider(
+        self,
+        provider: Callable,
+    ) -> PluginRegistration:
+        """Register a Slack App Home (``tab == "home"``) view provider.
+
+        Hermes' Slack adapter already listens for ``app_home_opened``. When
+        the opened tab is ``"home"``, registered providers are invoked so a
+        plugin can publish a custom Home view via ``views.publish`` — no
+        monkey-patching of ``SlackAdapter._handle_app_home_opened`` required.
+
+        Providers are queued at plugin-load time and looked up at event
+        dispatch time. That means deferred Slack platform loading and plugin
+        reloads both pick up the current registry without a second Socket
+        Mode connection.
+
+        Callback payload is keyword-only and additive (same rules as hooks).
+        A typical provider::
+
+            async def _home(*, client, user_id, team_id, publish_home, event, **_):
+                await publish_home({
+                    "type": "home",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": "*Hello*"},
+                        }
+                    ],
+                })
+
+            ctx.register_slack_home_provider(_home)
+
+        Keyword fields provided on every invocation:
+
+        * ``adapter`` — the live ``SlackAdapter`` instance
+        * ``client`` — workspace-specific Slack WebClient (multi-workspace safe)
+        * ``event`` — the inner ``app_home_opened`` event dict
+        * ``body`` — the outer Events API / Bolt envelope
+        * ``user_id`` — Slack user id that opened Home
+        * ``team_id`` — workspace / team id for the event
+        * ``publish_home`` — ``async (view: dict) -> Any`` helper that calls
+          ``client.views_publish(user_id=..., view=view)`` for the correct
+          workspace
+
+        Existing Hermes behaviour for ``tab == "messages"`` (Agent DM open)
+        and other non-home tabs is unchanged and does not invoke providers.
+        Interactive Block Kit actions continue to use
+        :meth:`register_slack_action_handler`.
+
+        Args:
+            provider: Callable (sync or async) accepting the keyword payload
+                above. Prefer ``**kwargs`` so additive fields stay compatible.
+
+        Raises:
+            ValueError: if ``provider`` is not callable.
+        """
+        if not callable(provider):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Slack "
+                f"home provider with a non-callable callback."
+            )
+        entry = (provider, self.manifest.name)
+        self._manager._slack_home_providers.append(entry)
+        handle = self._track(
+            "slack_home_provider",
+            getattr(provider, "__name__", "provider"),
+            lambda: self._manager._remove_identity(
+                self._manager._slack_home_providers, entry
+            ),
+        )
+        logger.debug(
+            "Plugin %s registered Slack home provider: %s",
+            self.manifest.name,
+            getattr(provider, "__name__", repr(provider)),
+        )
+        return handle
+
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------
@@ -3437,6 +3516,12 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Slack App Home providers registered by plugins. Each entry is
+        # (provider, plugin_name). The Slack adapter looks these up at
+        # app_home_opened (tab == "home") dispatch time so deferred platform
+        # load and plugin reloads both see the current registry without a
+        # second Socket Mode connection.
+        self._slack_home_providers: List[tuple] = []
         # Registration handles are kept both per plugin (ownership lookup) and
         # globally (reverse-order teardown for overrides spanning plugins).
         #
@@ -3717,6 +3802,7 @@ class PluginManager:
             self._system_prompt_sections.clear()
             self._approval_transports.clear()
             self._slack_action_handlers.clear()
+            self._slack_home_providers.clear()
             self._context_engine = None
             self._discovered = False
         else:
@@ -5289,6 +5375,17 @@ class PluginManager:
         :meth:`PluginContext.register_slack_action_handler`.
         """
         return list(self._slack_action_handlers)
+
+    def get_slack_home_providers(self) -> List[tuple]:
+        """Return the list of plugin-registered Slack App Home providers.
+
+        Each entry is a ``(provider, plugin_name)`` tuple. Consumed by the
+        Slack adapter when handling ``app_home_opened`` with ``tab == "home"``.
+
+        Plugins register providers via
+        :meth:`PluginContext.register_slack_home_provider`.
+        """
+        return list(self._slack_home_providers)
 
     # -----------------------------------------------------------------------
     # Introspection
