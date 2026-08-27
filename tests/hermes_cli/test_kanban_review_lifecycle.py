@@ -446,19 +446,22 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
             expected_run_id=claimed.current_run_id,
         )
         # Ready-lane task with the same fresh PR comment. It also needs a
-        # finished run: the ready-lane active_pr rule guards a *re*-spawn ("a
-        # prior worker already opened a PR"), so a task with no run history at
-        # all reads as a first spawn and the PR link as inherited context —
-        # see test_respawn_guard_active_pr_never_ran_task_is_not_guarded in
-        # tests/hermes_cli/test_kanban_db.py. ``crashed`` keeps the
-        # recent_success and rate_limit_cooldown rules out of the way.
+        # finished *completed* run: the ready-lane active_pr rule guards a
+        # *re*-spawn after successful PR work ("a prior worker already opened
+        # a PR"), so a task with no run history at all reads as a first spawn
+        # and the PR link as inherited context — see
+        # test_respawn_guard_active_pr_never_ran_task_is_not_guarded in
+        # tests/hermes_cli/test_kanban_db.py. Incomplete outcomes (crash/…)
+        # deliberately allow continue after recovery; completed outside the
+        # success window keeps recent_success and rate_limit_cooldown out of
+        # the way while still exercising the anti-duplicate guard.
         ready_id = kb.create_task(conn, title="already PRed", assignee="worker")
-        _prior = int(__import__("time").time()) - 3600
+        _prior = int(__import__("time").time()) - 7200
         with kb.write_txn(conn):
             conn.execute(
                 "INSERT INTO task_runs (task_id, profile, status, outcome, "
                 "started_at, ended_at) VALUES (?, 'worker', 'released', "
-                "'crashed', ?, ?)",
+                "'completed', ?, ?)",
                 (ready_id, _prior, _prior),
             )
         kb.add_comment(conn, ready_id, author="worker", body=pr_comment)

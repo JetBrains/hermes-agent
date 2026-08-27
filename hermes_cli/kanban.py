@@ -702,9 +702,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_unguard = sub.add_parser(
         "unguard",
         help=(
-            "Clear the active_pr respawn guard so a task can re-spawn "
-            "(deliberate follow-up/rework) even though a PR link is still "
-            "in its recent comments"
+            "Clear the active_pr respawn guard after successful PR work so "
+            "a task can re-spawn (deliberate follow-up/rework). Incomplete "
+            "recovery (crash/orphan/stale/timeout/reclaim) already continues "
+            "automatically; unguard is the explicit override when the latest "
+            "run completed with a live PR still in comments"
         ),
     )
     p_unguard.add_argument("task_ids", nargs="+")
@@ -3375,7 +3377,7 @@ Common subcommands:
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
-  `unguard <id>…`       Clear the active_pr respawn guard for a deliberate follow-up
+  `unguard <id>…`       Clear active_pr after successful PR work (incomplete recovery auto-continues)
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

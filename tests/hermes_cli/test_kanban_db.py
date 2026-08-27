@@ -538,17 +538,23 @@ def _add_pr_comment_at(conn, task_id, created_at, url=_PR_URL):
     )
 
 
-def _add_prior_run(conn, task_id, *, outcome="crashed"):
+def _add_prior_run(conn, task_id, *, outcome="completed", ended_ago=7200):
     """Record a finished run so the task reads as "already worked on".
 
     Part of the fixture, not the thing under test: ``active_pr`` guards a
     *re*-spawn, i.e. a task some earlier worker already ran and left a PR
     behind. A task with zero runs cannot have opened the PR its comments
     mention, so the guard deliberately stands down there (see the never-ran
-    tests below). ``crashed`` keeps block "3." (recent_success) and block
-    "1." (rate_limit_cooldown) out of the way.
+    tests below).
+
+    Default is a ``completed`` run outside ``_RESPAWN_GUARD_SUCCESS_WINDOW``
+    (2h ago): that is the anti-duplicate shape the guard still blocks when a
+    live PR remains. Incomplete outcomes (``crashed``, ``reclaimed``, …)
+    deliberately *allow* continue after recovery, so they must not be the
+    default for "still guarded" fixtures. ``ended_ago`` keeps block "3."
+    (recent_success) and block "1." (rate_limit_cooldown) out of the way.
     """
-    ts = int(time.time()) - 3600
+    ts = int(time.time()) - ended_ago
     conn.execute(
         "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, "
         "outcome) VALUES (?, 'alice', 'released', ?, ?, ?)",
@@ -871,7 +877,8 @@ def test_respawn_guard_active_pr_one_prior_run_still_guards(kanban_home):
     PR link plausibly ours again, so the duplicate-PR protection comes back.
 
     This is the line the never-ran release must not cross — it releases the
-    first spawn only, never a re-spawn.
+    first spawn only, never a re-spawn. Uses a completed prior run (outside
+    the success window): incomplete outcomes allow continue after recovery.
     """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="second-spawn", assignee="alice")
@@ -881,6 +888,111 @@ def test_respawn_guard_active_pr_one_prior_run_still_guards(kanban_home):
             conn, t, pr_state_resolver=lambda url: "open"
         )
     assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_incomplete_crashed_run_allows_continue(
+    kanban_home,
+):
+    """Crash→ready recovery must not stick on active_pr solely due to a PR URL.
+
+    Shape: worker posted a PR mid-run, then crashed; dispatcher restored the
+    card to ready. Same-task continue is intentional recovery, not a naive
+    duplicate respawn after successful work.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="crash-continue", assignee="alice")
+        _add_prior_run(conn, t, outcome="crashed")
+        kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
+        reason = kb.check_respawn_guard(
+            conn, t, pr_state_resolver=lambda url: "open"
+        )
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_incomplete_reclaimed_run_allows_continue(
+    kanban_home,
+):
+    """Orphan reconcile / stale-claim reclaim (outcome reclaimed) + PR URL.
+
+    Matches ``reconcile_orphaned_running`` / ``release_stale_claims`` ending
+    the broken run as ``reclaimed`` and restoring ready — continue must not
+    be blocked by the prior PR comment alone.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reclaim-continue", assignee="alice")
+        _add_prior_run(conn, t, outcome="reclaimed")
+        kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
+        reason = kb.check_respawn_guard(
+            conn, t, pr_state_resolver=lambda url: "open"
+        )
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_incomplete_then_completed_rearms_guard(
+    kanban_home,
+):
+    """A later successful completion with the same open PR re-arms active_pr."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rearm-after-complete", assignee="alice")
+        # Older incomplete recovery, then a finished success outside the
+        # recent_success window so only active_pr is under test.
+        _add_prior_run(conn, t, outcome="crashed", ended_ago=10_800)
+        _add_prior_run(conn, t, outcome="completed", ended_ago=7200)
+        kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
+        reason = kb.check_respawn_guard(
+            conn, t, pr_state_resolver=lambda url: "open"
+        )
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_crash_ready_dispatch_not_guarded(
+    kanban_home, monkeypatch
+):
+    """dispatch_once dry-run: crash→ready + PR comment is spawnable, not active_pr."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="crash-dispatch", assignee="alice")
+        _add_prior_run(conn, t, outcome="crashed")
+        kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
+        assert kb.check_respawn_guard(conn, t) is None
+        res = kb.dispatch_once(conn, dry_run=True)
+        guarded = dict(res.respawn_guarded)
+        assert guarded.get(t) != "active_pr"
+        assert t in [s[0] for s in res.spawned]
+
+
+def test_respawn_guard_active_pr_reconcile_orphan_then_not_guarded(
+    kanban_home, monkeypatch
+):
+    """Orphan reconcile ends the run as reclaimed; ready+PR must not active_pr."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="orphan-pr", assignee="alice")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        kb.add_comment(conn, t, "worker", f"PR opened: {_PR_URL}")
+        # Break claim bookkeeping the way orphan reconcile expects.
+        conn.execute(
+            "UPDATE tasks SET claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=?",
+            (t,),
+        )
+        conn.commit()
+        assert kb.reconcile_orphaned_running(conn) == [t]
+        assert kb.get_task(conn, t).status == "ready"
+        run = kb.latest_run(conn, t)
+        assert run is not None
+        assert run.outcome == "reclaimed"
+        assert kb.check_respawn_guard(
+            conn, t, pr_state_resolver=lambda url: "open"
+        ) is None
+        res = kb.dispatch_once(conn, dry_run=True)
+        assert dict(res.respawn_guarded).get(t) != "active_pr"
+        assert t in [s[0] for s in res.spawned]
 
 
 def test_respawn_guard_active_pr_spawn_event_without_run_row_still_guards(
