@@ -7966,6 +7966,25 @@ _RESPAWN_GUARD_CLEAR_EVENT_KINDS = (
     "respawn_guard_cleared",
 )
 
+# Latest finished-run outcomes that mean the prior attempt did not finish
+# successfully. Recovery paths (crash detection, orphan reconcile, stale
+# claim release, max-runtime, circuit breaker, block) stamp these and
+# requeue the card to ``ready``; the active_pr guard must then allow the
+# same-task continue rather than parking the card for 24h solely because
+# a worker already posted a PR URL mid-run. ``completed`` is intentionally
+# absent — a finished success with a live PR is the anti-duplicate case.
+# ``rate_limited`` is also absent: its cooldown is handled earlier in
+# ``check_respawn_guard`` and returns before the active_pr branch.
+_RESPAWN_GUARD_INCOMPLETE_OUTCOMES = frozenset({
+    "crashed",
+    "reclaimed",
+    "stale",
+    "timed_out",
+    "blocked",
+    "spawn_failed",
+    "gave_up",
+})
+
 # PR states in which a re-spawn can no longer collide with a live PR: a
 # closed or merged PR is already resolved, so a follow-up / rework run has
 # nothing to duplicate. ``open`` (and the unknown ``None``) keep the guard.
@@ -8028,8 +8047,9 @@ class DispatchResult:
 
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
-    ``"active_pr"`` (a live GitHub PR from a recent comment, with no newer
-    deliberate follow-up / unblock / unguard signal)."""
+    ``"active_pr"`` (a live GitHub PR from a recent comment after a
+    successful prior run, with no newer deliberate follow-up / unblock /
+    unguard signal and no incomplete latest-run recovery)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -9595,6 +9615,12 @@ def check_respawn_guard(
             so the link belongs to something else — typically a parent task's
             PR quoted in the briefing — and guarding on it would deadlock the
             task's very first spawn; or
+          * the newest finished run ended with an incomplete outcome
+            (``crashed`` / ``reclaimed`` / ``stale`` / ``timed_out`` /
+            ``blocked`` / ``spawn_failed`` / ``gave_up``). Dispatcher recovery
+            already restored the card to ``ready``; blocking solely on the
+            mid-run PR URL would strand same-task continue for 24h. A later
+            ``completed`` run with the same open PR re-arms the guard; or
           * the newest PR is actually ``closed`` / ``merged`` — there is no
             live PR left to duplicate. Live PR-state is consulted only when
             ``pr_state_resolver`` is supplied, or the built-in ``gh``-backed
@@ -9602,8 +9628,9 @@ def check_respawn_guard(
             An unknown state (``None``) keeps the guard, so the duplicate-PR
             protection never silently drops.
 
-        With none of those, a live/unknown PR and no newer deliberate signal
-        is exactly the auto-respawn duplicate this guard exists to stop.
+        With none of those, a live/unknown PR after a successful run and no
+        newer deliberate signal is exactly the auto-respawn duplicate this
+        guard exists to stop.
 
     ``pr_state_resolver`` (keyword-only, optional): a callable mapping a PR
     URL to ``"open"`` / ``"closed"`` / ``"merged"`` / ``None``. When omitted,
@@ -9701,15 +9728,18 @@ def check_respawn_guard(
     # 4. GitHub PR URL in a recent comment — a prior worker already opened a
     #    PR, and an *unintended* auto-respawn would risk a duplicate PR. This
     #    is the one guard reason that must yield to deliberate operator/human
-    #    intent (follow-up / rework / unblock), so we don't block on the mere
-    #    presence of a PR link:
+    #    intent (follow-up / rework / unblock) and to incomplete-run recovery,
+    #    so we don't block on the mere presence of a PR link:
     #      a) find the NEWEST PR-URL comment in the window (older links are
     #         irrelevant — only the most recent PR could be duplicated);
     #      b) if the task has no run history at all, that PR cannot be ours —
     #         allow it (this is a first spawn, not a re-spawn);
     #      c) if a deliberate continuation signal landed at/after it, the
     #         re-spawn is intentional rework — allow it;
-    #      d) if that PR is actually closed/merged, there is nothing live to
+    #      d) if the newest finished run is incomplete (crash/orphan/stale/
+    #         timeout/reclaim/…), recovery already requeued the card — allow
+    #         same-task continue even while the PR is still open;
+    #      e) if that PR is actually closed/merged, there is nothing live to
     #         duplicate — allow it (only checked when a resolver is available;
     #         unknown state keeps the guard).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
@@ -9728,7 +9758,18 @@ def check_respawn_guard(
             conn, task_id, newest_pr_ts, pr_comment_id=newest_pr_id
         ):
             return None
-        # (d) PR actually resolved (closed/merged) → nothing live to duplicate.
+        # (d) latest finished run did not complete successfully → recovery
+        #     continue. Crash/orphan/stale/timeout/reclaim (and sibling
+        #     incomplete terminals) already put the card back on ready; the
+        #     mid-run PR URL must not strand the same-task respawn for 24h.
+        #     A later successful completion with the same open PR re-arms.
+        #     Reuses the latest-run row from the rate-limit probe above.
+        if (
+            latest_run is not None
+            and latest_run["outcome"] in _RESPAWN_GUARD_INCOMPLETE_OUTCOMES
+        ):
+            return None
+        # (e) PR actually resolved (closed/merged) → nothing live to duplicate.
         resolver = pr_state_resolver
         if resolver is None and _resolve_pr_state_check_enabled():
             resolver = _resolve_github_pr_state

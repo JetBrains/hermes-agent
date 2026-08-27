@@ -193,14 +193,16 @@ def test_run_slash_unguard_clears_active_pr_guard(kanban_home):
     import time
     out = kc.run_slash("create 'x' --assignee alice")
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
-    # A worker left a PR link in a recent comment → active_pr guard trips.
+    # A worker left a PR link after a *completed* run → active_pr guard trips.
+    # Completed outside the recent_success window is the anti-duplicate shape;
+    # incomplete outcomes (crash/…) deliberately allow continue after recovery.
     # The finished run is what makes that PR plausibly this task's: the guard
     # is about a RE-spawn and stands down for a task that never ran at all.
     with kb.connect() as conn:
-        ts = int(time.time()) - 3600
+        ts = int(time.time()) - 7200
         conn.execute(
             "INSERT INTO task_runs (task_id, profile, status, started_at, "
-            "ended_at, outcome) VALUES (?, 'alice', 'released', ?, ?, 'crashed')",
+            "ended_at, outcome) VALUES (?, 'alice', 'released', ?, ?, 'completed')",
             (tid, ts, ts),
         )
         conn.commit()
