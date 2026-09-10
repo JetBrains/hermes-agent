@@ -29,6 +29,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
+    FINAL_REPORT_SUPPRESSION_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
@@ -982,6 +983,32 @@ class TestParallelToolCallGuidance:
     def test_has_a_heading(self):
         # Heading delimits it as its own section in the assembled prompt.
         assert PARALLEL_TOOL_CALL_GUIDANCE.lstrip().startswith("#")
+
+
+class TestFinalReportSuppressionGuidance:
+    """Behavior contracts for the end-of-session final-report suppression block.
+
+    The OFF switch must be deterministic: the block names the exact report
+    headings it removes, so the model has no room to keep the block under a
+    reworded heading. These assert the invariants, not the exact wording.
+    """
+
+    def test_is_nonempty_string(self):
+        assert isinstance(FINAL_REPORT_SUPPRESSION_GUIDANCE, str)
+        assert FINAL_REPORT_SUPPRESSION_GUIDANCE.strip()
+
+    def test_has_a_heading(self):
+        # Heading delimits it as its own section in the assembled prompt.
+        assert FINAL_REPORT_SUPPRESSION_GUIDANCE.lstrip().startswith("#")
+
+    def test_names_every_report_heading(self):
+        # Deterministic OFF: the block must name each heading it suppresses so
+        # the model cannot keep the report under a synonym.
+        for heading in ("### Summary", "### Changes", "### Verification", "### Notes"):
+            assert heading in FINAL_REPORT_SUPPRESSION_GUIDANCE
+
+    def test_directs_a_plain_answer(self):
+        assert "plain" in FINAL_REPORT_SUPPRESSION_GUIDANCE.lower()
 
 
 

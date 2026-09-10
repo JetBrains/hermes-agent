@@ -1889,6 +1889,15 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
+    # End-of-session final-report toggle.  Default True (report on — status
+    # quo).  When False, the system prompt gains an explicit block that
+    # suppresses the trailing "### Summary / ### Changes / ### Verification"
+    # (optional "### Notes") report, so a product that embeds Hermes behind
+    # its own run-summary UI gets a plain, concise final answer instead of the
+    # duplicated block.  Read once at init → cache-safe (stable per session);
+    # a change takes effect on the next session, like the sibling flags.
+    agent._final_report = bool(_agent_section.get("final_report", True))
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics

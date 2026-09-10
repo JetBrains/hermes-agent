@@ -1135,6 +1135,69 @@ class TestTaskCompletionGuidance:
             assert TASK_COMPLETION_GUIDANCE not in a._build_system_prompt()
 
 
+class TestFinalReportToggle:
+    """End-to-end wiring for the final-report toggle (config.yaml
+    ``agent.final_report``).
+
+    Exercises the real chain — config → agent_init → system_prompt — against a
+    constructed AIAgent, not a hand-set attribute.  Default (report on) leaves
+    the prompt clean; setting it False injects the explicit suppression block
+    that names the report headings, so an embedding product gets a plain
+    answer."""
+
+    def _make_agent(self, final_report=True, tools=("terminal", "web_search")):
+        agent_cfg = {"final_report": final_report}
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs(*tools),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": agent_cfg},
+            ), patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"agent": agent_cfg},
+            ),
+        ):
+            a = AIAgent(
+                model="anthropic/claude-opus-4.8",
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                enabled_toolsets=list(tools),
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_default_leaves_prompt_clean(self):
+        from agent.prompt_builder import FINAL_REPORT_SUPPRESSION_GUIDANCE
+        agent = self._make_agent(final_report=True)
+        assert agent._final_report is True
+        assert FINAL_REPORT_SUPPRESSION_GUIDANCE not in agent._build_system_prompt()
+
+    def test_disabled_injects_suppression(self):
+        from agent.prompt_builder import FINAL_REPORT_SUPPRESSION_GUIDANCE
+        agent = self._make_agent(final_report=False)
+        assert agent._final_report is False
+        prompt = agent._build_system_prompt()
+        assert FINAL_REPORT_SUPPRESSION_GUIDANCE in prompt
+        # The exact headings the integrator wants gone are named in the prompt.
+        for heading in ("### Summary", "### Changes", "### Verification", "### Notes"):
+            assert heading in prompt
+
+    def test_disabled_injects_without_tools(self):
+        # The report closes any task, so the OFF switch fires even with no
+        # toolset loaded — unlike the tool-scoped guidance blocks.
+        from agent.prompt_builder import FINAL_REPORT_SUPPRESSION_GUIDANCE
+        agent = self._make_agent(final_report=False, tools=())
+        assert FINAL_REPORT_SUPPRESSION_GUIDANCE in agent._build_system_prompt()
+
+
 class TestEnvironmentProbeIntegration:
     """Tests for the local Python toolchain probe wiring (config.yaml
     ``agent.environment_probe``).  The probe itself is unit-tested in

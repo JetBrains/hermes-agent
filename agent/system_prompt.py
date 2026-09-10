@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
+    FINAL_REPORT_SUPPRESSION_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
@@ -335,6 +336,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # (default True) and only injected when tools are actually loaded.
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+
+    # End-of-session final-report toggle.  When ``agent.final_report`` is
+    # False, a product integrator wants a plain final answer with no trailing
+    # "### Summary / ### Changes / ### Verification" (optional "### Notes")
+    # status block — the surface renders its own run summary.  The suppression
+    # block names those exact headings so the OFF switch is deterministic, not
+    # a soft hint.  Independent of the loaded toolset: the report closes any
+    # task, tools or not.  Default True injects nothing, so the cached prompt
+    # stays byte-identical to before (prompt caching and current behaviour
+    # unaffected).  Resolved once at init → stable per session.
+    if not getattr(agent, "_final_report", True):
+        stable_parts.append(FINAL_REPORT_SUPPRESSION_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
