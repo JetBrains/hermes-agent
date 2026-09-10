@@ -116,6 +116,36 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
+class TestFinalReportBlock:
+    """``agent.final_report`` gates the end-of-session report suppression block.
+
+    Default (report on) leaves the prompt byte-identical — no block injected.
+    Setting it False injects an explicit block that names the report headings,
+    so an embedding product gets a plain final answer. The block is independent
+    of the loaded toolset: a task closes with or without tools.
+    """
+
+    _MARKER = "Do not end the session with a structured status report"
+
+    def test_absent_by_default(self):
+        # Default agent leaves ``_final_report`` unset → getattr default True →
+        # nothing injected (byte-identical prompt, caching preserved).
+        agent = _make_agent(valid_tool_names=["read_file"])
+        assert self._MARKER not in _stable_prompt(agent)
+
+    def test_present_when_disabled(self):
+        agent = _make_agent(valid_tool_names=["read_file"], _final_report=False)
+        stable = _stable_prompt(agent)
+        assert self._MARKER in stable
+        assert "### Summary" in stable
+
+    def test_present_when_disabled_without_tools(self):
+        # The report closes any task, so the OFF switch must fire even when no
+        # toolset is loaded (unlike the tool-scoped guidance blocks).
+        agent = _make_agent(valid_tool_names=[], _final_report=False)
+        assert self._MARKER in _stable_prompt(agent)
+
+
 def test_build_system_prompt_records_stable_prefix():
     agent = _make_agent()
     with (

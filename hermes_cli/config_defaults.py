@@ -134,6 +134,16 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # End-of-session final report — controls the trailing structured status
+        # block ("### Summary / ### Changes / ### Verification", plus an
+        # optional "### Notes") that closes a task.  Default True keeps the
+        # report (current behaviour; injects nothing into the prompt).  Set
+        # False to suppress it: the system prompt then carries an explicit
+        # directive that names those exact headings, and the agent returns a
+        # plain, concise final answer instead.  Use this when a product embeds
+        # Hermes in a surface that renders its own run-summary UI and does not
+        # want the duplicate block.  Cache-safe: takes effect next session.
+        "final_report": True,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

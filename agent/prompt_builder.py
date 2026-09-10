@@ -413,6 +413,28 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "in doubt and the calls are independent, batch them."
 )
 
+# End-of-session final-report suppression.
+#
+# By default Hermes closes a task with a short structured report — the
+# "### Summary / ### Changes / ### Verification" block, plus an optional
+# "### Notes" section.  A product that embeds Hermes behind its own UI (a
+# surface that renders its own run summary) does not want that trailing block
+# duplicated in the model's answer.  This block is injected ONLY when the
+# integrator sets ``agent.final_report: false``; it names the exact headings
+# so the suppression is deterministic, not a soft hint.  The default (report
+# on) injects nothing, so the cached prompt stays byte-identical to before.
+#
+# Short on purpose — it rides in the cached system prompt, so the token cost
+# is paid once and amortised across the session via prefix caching.
+FINAL_REPORT_SUPPRESSION_GUIDANCE = (
+    "# Final answer format\n"
+    "Do not end the session with a structured status report. Do not add a "
+    "trailing block that uses the headings `### Summary`, `### Changes`, "
+    "`### Verification`, or `### Notes`. Give a short, direct final answer in "
+    "plain prose. State the result first, then add only the detail the user "
+    "needs."
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.
